@@ -374,7 +374,7 @@ with an error. All fields are optional.
 |--------------|-------------|
 | `notes` | The rules in plain words (not used by the generator) |
 | `exclude` | Models or groups that never get effects. Imported sequences are never mapped onto them, or onto any group containing them |
-| `strobes` | Strobes only inside the finale (a section mark named `finale`, else the last run of peaks), every `every_beats` beats. In imported sequences, finale strobes are re-timed to that spacing and others removed; without the song's audio, all strobes are removed |
+| `strobes` | Strobes only inside the finale (a section mark named `finale`, else the last run of peaks), every `every_beats` beats. In imported sequences, finale strobes are re-timed to that spacing and others removed. The finale comes from the sequence's audio — its media path, or else an MP3 in the show's `Music` folder matching it by title (track numbers, bracketed extras and punctuation ignored); only if neither is found are all strobes removed |
 | `white` | Whites are the listed `colors` plus anything paler than `max_saturation`. Every white is tinted to at least `min_tint` (neutral white gets a warm tint) and capped at `max_brightness`, except in `full_white_effects` (strobes) and the final hit, which may use `full_white`. No prop shows only white (all active colors white, or a one-color effect like On led by white) for more than `max_seconds` at a time or `max_share` of the song; offenders lead with a non-white color instead (or `fallback_colors` when the palette has none). Effects on part of a prop (one arch of the chase) don't count toward those limits |
 
 | Style field | Enforced as |

@@ -153,6 +153,9 @@ def test_preview_lists_singing_moments(tmp_path, monkeypatch):
     preview = engine.preview_sequence_plan(mp3, tmp_path, model_priorities={"TREES": "hero"})
     singing = preview["rules"]["singing"]
     assert singing["moments"][0]["start"] == "4.20s" and singing["share"] == pytest.approx(3.4 / 32, abs=1e-3)
+    # The flood is held through the moment, across the 6 s boundary, and the preview says so
+    floods = {sec["start"]: sec["flood_color"] for sec in preview["sections"]}
+    assert floods["6.0s"] is not None and floods["6.0s"] == floods["4.0s"]
     created = engine.generate_sequence(mp3, tmp_path, model_priorities={"TREES": "hero"})
     assert created["plan_id"] == preview["plan_id"]
 

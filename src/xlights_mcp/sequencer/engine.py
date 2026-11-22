@@ -601,8 +601,10 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
     for i, s in enumerate(analysis.sections):
         here = [e for e in effects if overlaps(e, s)]
         lit = {e.model_name for e in here}
-        flood = next((e.palette.colors[0] for e in here
-                      if e.model_name in floods and e.palette and e.start_time_ms == s.start_time_ms), None)
+        # The flood color showing as the section starts (it may be held from a singing moment)
+        flood = next((e.palette.colors[0] for e in effects
+                      if e.model_name in floods and e.layer == 0 and e.palette
+                      and e.start_time_ms <= s.start_time_ms < e.end_time_ms), None)
         sections.append({
             "label": s.label, "tier": tiers[i],
             "start": f"{s.start_time:.1f}s", "end": f"{s.end_time:.1f}s", "energy": f"{s.energy_level:.2f}",

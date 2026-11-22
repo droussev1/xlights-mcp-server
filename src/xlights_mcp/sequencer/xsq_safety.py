@@ -5,7 +5,8 @@ written straight from their XML, so the same rules are applied to the tree here:
 
 - excluded models (and groups containing them) lose their effects
 - strobes outside the finale are removed; strobes inside it become half-time hits.
-  Without the song's audio there is no finale to find, so every strobe is removed
+  The finale comes from the song's audio — the sequence's own media path, else an MP3 in
+  the show's Music folder matching it by title. Without either, every strobe is removed
 - whites are tinted and capped, white-only looks are limited, and full white is kept
   only in strobes
 """
@@ -14,6 +15,8 @@ from __future__ import annotations
 
 import copy
 import re
+from difflib import SequenceMatcher
+from pathlib import Path
 
 from lxml import etree
 
@@ -25,6 +28,34 @@ from xlights_mcp.xlights.palettes import ColorPalette
 from xlights_mcp.xlights.xsq_writer import EffectPlacement
 
 HEX = re.compile(r"#[0-9A-Fa-f]{6}")
+
+
+MIN_TITLE_MATCH = 0.85
+_TRACK_NUMBER = re.compile(r"^\s*\d+(?:[-.]\d+)?\s*[-._)]?\s*")  # "06 ", "01 - ", "01-02 "
+_BRACKETED = re.compile(r"[(\[][^)\]]*[)\]]")                     # "(Remastered)", "[feat. X]"
+
+
+def normalize_title(text: str) -> str:
+    """A song title reduced for matching: no folders, extension, track number, brackets or punctuation."""
+    name = text.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"\.(mp3|m4a|wav|ogg|flac|aac)$", "", name, flags=re.IGNORECASE)
+    name = _TRACK_NUMBER.sub("", _BRACKETED.sub(" ", name))
+    return " ".join(re.findall(r"[a-z0-9']+", name.lower()))
+
+
+def find_matching_audio(titles: list[str | None], folders: list[Path]) -> Path | None:
+    """The MP3 under ``folders`` whose title best matches any of ``titles`` (None if none is close)."""
+    wanted = {t for t in (normalize_title(x) for x in titles if x) if t}
+    best: tuple[float, Path | None] = (0.0, None)
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for f in sorted(p for p in folder.rglob("*") if p.suffix.lower() == ".mp3"):
+            name = normalize_title(f.name)
+            score = max((1.0 if name == w else SequenceMatcher(None, name, w).ratio() for w in wanted), default=0)
+            if score > best[0]:
+                best = (score, f)
+    return best[1] if best[0] >= MIN_TITLE_MATCH else None
 
 
 def unsafe_targets(rules: ShowRules, show_config: ShowConfig) -> set[str]:

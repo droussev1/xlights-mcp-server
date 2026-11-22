@@ -179,3 +179,69 @@ async def test_remap_sequence_applies_safety_rules(tmp_path, monkeypatch):
     assert [e.get("name") for e in tree] == ["On"]  # strobe dropped: no audio to find the finale
     assert _colors(out, tree[0])["C_BUTTON_Palette1"] != "#FFFFFF"  # 4 s of white-only recolored
     assert any("Safety rules" in w for w in result["mapping_report"]["warnings"])
+
+
+def test_find_matching_audio_by_title(tmp_path):
+    from xlights_mcp.sequencer.xsq_safety import find_matching_audio, normalize_title
+    music = tmp_path / "Music"
+    (music / "Album").mkdir(parents=True)
+    for name in ("06 Holly Jolly Christmas.mp3", "02 - Silver Bells (Remastered).mp3", "Album/01-02 Frosty the Snowman.MP3",
+                 "07 Holly Jolly Christmas.m4a"):
+        (music / name).write_bytes(b"")
+    assert normalize_title(r"C:\Music\01 - Light Of Christmas [feat. TobyMac].mp3") == "light of christmas"
+    assert find_matching_audio([None, r"D:\Audio\A Holly Jolly Christmas.mp3"], [music]).name == "06 Holly Jolly Christmas.mp3"
+    assert find_matching_audio(["Frosty The Snowman (Remix)"], [music]).name == "01-02 Frosty the Snowman.MP3"
+    assert find_matching_audio(["Christmas"], [music]) is None
+    assert find_matching_audio(["Jingle Bell Rock"], [tmp_path / "missing"]) is None
+
+
+def _remap_with_media(tmp_path, monkeypatch, music_files):
+    """Remap a sequence whose media path doesn't exist, with given files in the show's Music folder."""
+    import asyncio
+    from xlights_mcp import server
+    from xlights_mcp.audio import analyzer
+    from xlights_mcp.config import ServerConfig
+    from xlights_mcp.xlights.palettes import ColorPalette
+    from xlights_mcp.xlights.xsq_writer import EffectPlacement, SequenceSpec, write_xsq
+
+    show_dir = tmp_path / "show"
+    (show_dir / "Music").mkdir(parents=True)
+    for name in music_files:
+        (show_dir / "Music" / name).write_bytes(b"")
+    (show_dir / "xlights_rgbeffects.xml").write_text(
+        '<xrgb><models><model name="Sign" DisplayAs="Custom" PixelCount="50"/>'
+        '<model name="Tree" DisplayAs="Tree" PixelCount="500"/></models></xrgb>')
+    (show_dir / "xlights_mcp_rules.json").write_text(RULES.model_dump_json())
+    red = ColorPalette(colors=["#FF0000"], active_colors=[1])
+    imported = SequenceSpec(
+        song_title="Holly Jolly Christmas", duration_ms=32000, timing_ms=25, palettes=[red],
+        media_file=r"C:\Users\someone\Music\Holly Jolly Christmas.mp3",
+        effects=[EffectPlacement(model_name="Tree", effect_name="Strobe", start_time_ms=24000,
+                                 end_time_ms=28000, palette=red)],
+    )
+    src = ShowConfig(show_path=str(tmp_path), show_name="src",
+                     models=[LightModel(name="Tree", display_as="Tree", pixel_count=500)])
+    write_xsq(imported, src, tmp_path / "imported.xsq")
+    analyzed = []
+    monkeypatch.setattr(analyzer, "full_analysis", lambda path, *_: analyzed.append(path) or _analysis())
+    monkeypatch.setattr(server, "get_config", lambda: ServerConfig(show_folders={"t": str(show_dir)}, active_show="t"))
+    result = asyncio.run(server.remap_sequence(str(tmp_path / "imported.xsq"), show_name="t"))
+    assert result["success"], result
+    out = etree.parse(result["output_path"]).getroot()
+    strobes = [e for e in _effects(out, "Tree") if e.get("name") == "Strobe"]
+    return result, analyzed, strobes
+
+
+def test_remap_finds_audio_in_music_folder_by_title(tmp_path, monkeypatch):
+    result, analyzed, strobes = _remap_with_media(tmp_path, monkeypatch, ["06 Holly Jolly Christmas.mp3"])
+    assert [p.name for p in analyzed] == ["06 Holly Jolly Christmas.mp3"]
+    # The finale (24–32 s) was found, so the strobe is re-timed to half time instead of removed
+    assert [int(e.get("startTime")) for e in strobes] == [24000, 25000, 26000, 27000]
+    assert any("matched by title" in w for w in result["mapping_report"]["warnings"])
+
+
+def test_remap_removes_strobes_only_when_no_audio_matches(tmp_path, monkeypatch):
+    result, analyzed, strobes = _remap_with_media(tmp_path, monkeypatch, ["02 - Silver Bells.mp3"])
+    assert analyzed == [] and strobes == []
+    warnings = result["mapping_report"]["warnings"]
+    assert any("searched" in w for w in warnings) and any("no audio" in w for w in warnings)

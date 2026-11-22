@@ -682,7 +682,8 @@ async def remap_sequence(
             report=report,
             show_folder=show_path,
             fallback_name=import_file.stem,
-            safety=(lambda root: _remap_safety(root, rules, show_config, show_path, config)) if rules else None,
+            safety=(lambda root: _remap_safety(root, rules, show_config, show_path, config, import_file.stem))
+            if rules else None,
         )
     except Exception as e:
         return RemapResult(
@@ -700,23 +701,41 @@ async def remap_sequence(
     ).model_dump()
 
 
-def _remap_safety(root, rules, show_config, show_path: Path, config: ServerConfig) -> list[str]:
-    """Apply safety rules to a remapped tree, analyzing its audio to find the finale."""
+def _remap_safety(root, rules, show_config, show_path: Path, config: ServerConfig, import_name: str) -> list[str]:
+    """Apply safety rules to a remapped tree, analyzing its audio to find the finale.
+
+    If the sequence's media path doesn't resolve, an MP3 in the show's Music folder that
+    matches it by title is used; strobes are only all removed when nothing matches.
+    """
     from xlights_mcp.audio.analyzer import full_analysis
     from xlights_mcp.sequencer.engine import _rank_section_energy
-    from xlights_mcp.sequencer.xsq_safety import apply_safety
+    from xlights_mcp.sequencer.xsq_safety import apply_safety, find_matching_audio
+
+    notes: list[str] = []
+    media = (root.findtext("head/mediaFile") or "").strip()
+    media_path = None
+    if media:
+        candidate = Path(media) if Path(media).is_absolute() else show_path / media
+        if candidate.exists():
+            media_path = candidate
+    if media_path is None:
+        music = show_path / "Music"
+        media_path = find_matching_audio([root.findtext("head/song"), media, import_name], [music])
+        if media_path:
+            notes.append(f"Safety rules: audio '{media or '(none)'}' not found; using '{media_path.name}' "
+                         f"from {music}, matched by title, to find the finale")
+        elif rules.safety.strobes:
+            notes.append(f"Safety rules: no audio found for this sequence (searched {music} by title)")
 
     analysis = tiers = None
-    media = (root.findtext("head/mediaFile") or "").strip()
-    if media:
-        media_path = Path(media) if Path(media).is_absolute() else show_path / media
-        if media_path.exists():
-            try:
-                analysis = full_analysis(media_path, config.audio)
-                tiers = _rank_section_energy(analysis.sections)
-            except Exception as e:  # noqa: BLE001 — fall back to the no-audio rules
-                logger.warning(f"Audio analysis failed for {media_path}: {e}")
-    return apply_safety(root, rules, show_config, analysis, tiers)
+    if media_path:
+        try:
+            analysis = full_analysis(media_path, config.audio)
+            tiers = _rank_section_energy(analysis.sections)
+        except Exception as e:  # noqa: BLE001 — fall back to the no-audio rules
+            logger.warning(f"Audio analysis failed for {media_path}: {e}")
+            notes.append(f"Safety rules: couldn't analyze '{media_path.name}': {e}")
+    return notes + apply_safety(root, rules, show_config, analysis, tiers)
 
 
 # ---------------------------------------------------------------------------
