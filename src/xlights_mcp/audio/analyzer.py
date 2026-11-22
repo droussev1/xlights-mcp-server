@@ -34,6 +34,7 @@ class StemOnsets(BaseModel):
     energy: list[float] = Field(default_factory=list)  # normalized 0-1 per frame
     energy_times: list[float] = Field(default_factory=list)  # seconds
     mean_energy: float = 0.0
+    peak_rms: float = 0.0  # the stem's loudest RMS; energy × peak_rms = absolute level
 
 
 class StemAnalysis(BaseModel):
@@ -55,6 +56,12 @@ class StemAnalysis(BaseModel):
         s = self.stems[stem]
         energies = [e for t, e in zip(s.energy_times, s.energy) if start <= t < end]
         return float(np.mean(energies)) if energies else 0.0
+
+    def get_level_in_range(self, stem: str, start: float, end: float) -> float:
+        """Mean absolute RMS level of a stem in a time range (comparable across stems)."""
+        if stem not in self.stems:
+            return 0.0
+        return self.get_mean_energy_in_range(stem, start, end) * self.stems[stem].peak_rms
 
     def dominant_stem(self, start: float, end: float) -> str:
         """Return the stem name with highest mean energy in a time range."""
@@ -198,6 +205,7 @@ def analyze_stems(stem_paths: StemPaths, sr: int = 22050) -> StemAnalysis:
                 energy=normalized_rms,
                 energy_times=rms_times,
                 mean_energy=mean_energy,
+                peak_rms=max_rms,
             )
             logger.info(f"  Stem '{name}': {len(onset_times)} onsets, mean energy {mean_energy:.2f}")
 

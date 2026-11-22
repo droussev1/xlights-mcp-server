@@ -470,8 +470,8 @@ def create_sequence(
         vocal_assignments: Optional mapping of model names to vocal track names.
             Use {"all": "<track_name>"} to assign one track to all singing models,
             or map individual models like {"Snowman": "Vocals", "Bulb Blue": "Full Mix Vocals"}.
-            If omitted and singing models are detected, returns available models and
-            tracks so you can prompt the user for assignments.
+            If omitted, every singer uses the vocal-stem track. A low-confidence
+            transcription is treated as no lyrics (singers run regular effects).
         show_name: Which show folder to generate the sequence in (e.g., "christmas",
             "halloween"). If omitted and multiple shows exist, returns available
             shows so you can ask the user which one to use.
@@ -504,15 +504,28 @@ def create_sequence(
 
 
 @mcp.tool()
-def preview_plan(mp3_path: str, mode: str = "auto", show_name: str | None = None) -> dict:
-    """Preview the sequence generation plan without creating a file.
+def preview_plan(
+    mp3_path: str,
+    mode: str = "auto",
+    vocal_assignments: dict[str, str] | None = None,
+    palette_hint: str | None = None,
+    theme: str | None = None,
+    show_name: str | None = None,
+) -> dict:
+    """Preview exactly what create_sequence would produce, without writing a file.
 
-    Shows what effects would be placed on which models, based on the
-    audio analysis and selected mode.
+    Runs the full generation — per-song settings, show rules, singing, palettes — and
+    summarizes it per section (tier, symmetry mode, arch chase, flood color, lit and dark
+    props, accent props) and per rule (exclusions, final hit, strobes, signature colors,
+    accent share, full-white moments, lyrics). Its plan_id matches the plan_id
+    create_sequence returns when given the same arguments.
 
     Args:
         mp3_path: Path to the .mp3 file
         mode: Generation mode — "auto", "guided", or "template"
+        vocal_assignments: Same as create_sequence (defaults singers to the vocal stem)
+        palette_hint: Same as create_sequence
+        theme: Same as create_sequence
         show_name: Which show folder to preview against. If omitted and multiple
             shows exist, returns available shows so you can ask the user.
     """
@@ -532,6 +545,10 @@ def preview_plan(mp3_path: str, mode: str = "auto", show_name: str | None = None
         show_path=show_path,
         mode=mode,
         audio_config=config.audio,
+        vocal_assignments=vocal_assignments,
+        model_priorities=config.model_priorities.get(config.show_name_for(show_path) or "", {}),
+        palette_hint=palette_hint,
+        theme=theme,
     )
 
 
@@ -625,9 +642,22 @@ async def remap_sequence(
             success=False, error="Imported sequence contains no models with effects."
         ).model_dump()
 
+    # Show safety rules: never map onto excluded models or groups containing them
+    from xlights_mcp.sequencer import show_rules as show_rules_mod
+    from xlights_mcp.sequencer.xsq_safety import unsafe_targets
+
+    try:
+        rules, _ = show_rules_mod.load_show_rules(show_path)
+        if rules:
+            show_rules_mod.validate_models(rules, show_config)
+    except ValueError as e:
+        return RemapResult(success=False, error=str(e)).model_dump()
+    unsafe = unsafe_targets(rules, show_config) if rules else set()
+
     # Build candidates
     user_candidates = build_candidates_from_user_show(
-        show_config.models, show_config.model_groups
+        [m for m in show_config.models if m.name not in unsafe],
+        [g for g in show_config.model_groups if g.name not in unsafe],
     )
     imported_candidates = build_candidates_from_import(
         seq_data.model_names, imported_meta, seq_data.model_effect_counts
@@ -652,6 +682,7 @@ async def remap_sequence(
             report=report,
             show_folder=show_path,
             fallback_name=import_file.stem,
+            safety=(lambda root: _remap_safety(root, rules, show_config, show_path, config)) if rules else None,
         )
     except Exception as e:
         return RemapResult(
@@ -667,6 +698,25 @@ async def remap_sequence(
         output_path=str(output_path),
         mapping_report=report,
     ).model_dump()
+
+
+def _remap_safety(root, rules, show_config, show_path: Path, config: ServerConfig) -> list[str]:
+    """Apply safety rules to a remapped tree, analyzing its audio to find the finale."""
+    from xlights_mcp.audio.analyzer import full_analysis
+    from xlights_mcp.sequencer.engine import _rank_section_energy
+    from xlights_mcp.sequencer.xsq_safety import apply_safety
+
+    analysis = tiers = None
+    media = (root.findtext("head/mediaFile") or "").strip()
+    if media:
+        media_path = Path(media) if Path(media).is_absolute() else show_path / media
+        if media_path.exists():
+            try:
+                analysis = full_analysis(media_path, config.audio)
+                tiers = _rank_section_energy(analysis.sections)
+            except Exception as e:  # noqa: BLE001 — fall back to the no-audio rules
+                logger.warning(f"Audio analysis failed for {media_path}: {e}")
+    return apply_safety(root, rules, show_config, analysis, tiers)
 
 
 # ---------------------------------------------------------------------------

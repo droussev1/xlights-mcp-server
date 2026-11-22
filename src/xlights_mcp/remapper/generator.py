@@ -206,6 +206,7 @@ def generate_remapped_sequence(
     show_folder: Path,
     base_name: str | None = None,
     fallback_name: str | None = None,
+    safety=None,
 ) -> tuple[Path, list[str], list[str]]:
     """Generate a remapped .xsq file in the user's show folder.
 
@@ -216,6 +217,8 @@ def generate_remapped_sequence(
         base_name: Base name for the output file (without extension).
             Defaults to the song name from <head>.
         fallback_name: Name to use when the song title is empty or generic.
+        safety: Optional callable applied to the remapped tree before writing (the
+            show's safety rules); returns warnings, added to the returned warnings.
 
     Returns:
         Path to the written .xsq file.
@@ -251,6 +254,10 @@ def generate_remapped_sequence(
 
     # Detect missing assets
     missing_assets, asset_warnings = _detect_missing_assets(new_root, show_folder)
+
+    # Show safety rules (exclusions, strobe limit, white cap) apply to imports too
+    if safety is not None:
+        asset_warnings = [*asset_warnings, *safety(new_root)]
     # Note: caller should update report.missing_assets and report.warnings
 
     # Determine output path

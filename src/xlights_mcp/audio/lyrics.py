@@ -52,6 +52,7 @@ class LyricTrack(BaseModel):
     track_name: str = "Lyric Track"
     source: str = "full_mix"  # "full_mix", "vocals_stem", etc.
     available: bool = False
+    confidence: float = 0.0  # mean Whisper word probability, 0–1
 
 
 # Mapping of English letter patterns to xLights phoneme codes
@@ -154,6 +155,7 @@ def extract_lyrics(
 
     # Extract word-level timestamps from segments
     words: list[LyricWord] = []
+    probabilities: list[float] = []
     for segment in result.get("segments", []):
         for word_info in segment.get("words", []):
             word = word_info.get("word", "").strip()
@@ -161,6 +163,7 @@ def extract_lyrics(
             end = word_info.get("end", 0.0)
             if word and end > start:
                 words.append(LyricWord(word=word, start_time=start, end_time=end))
+                probabilities.append(float(word_info.get("probability", 0.0)))
 
     if not words:
         logger.warning("No words detected in transcription")
@@ -178,6 +181,7 @@ def extract_lyrics(
         track_name="Lyric Track",
         source="full_mix",
         available=True,
+        confidence=sum(probabilities) / len(probabilities),
     )
 
 

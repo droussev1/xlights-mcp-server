@@ -355,28 +355,43 @@ To hand-tune one song, put a JSON file next to the music file with the same name
 | `unmarked_tier` | Tier for sections no mark covers. Omit it to rank them by energy as usual |
 | `signature_colors` | One or two `#RRGGBB` accent colors for this song, overriding the show's pick |
 | `final_hit` | Seconds; overrides the detected final hit |
+| `singing` | Overrides for the show's `singing.moments` settings, e.g. `{"vocal_drum_ratio": 2.5, "max_share": 0.3}` |
 | `effects` | Custom effects on `models` (model or group names) for a named `section` or a `start`/`end` range, on `layer` 0–2. `effect` is an engine preset (`Strobe_flash`, `Butterfly_gentle`, `Spirals_fast`, …) or any xLights effect name; `settings` override preset values. `every_beats` repeats it on every Nth beat from the bar line (`length_beats` long); omit both for one effect across the range. Generated effects on the same models and layer are cleared from that range |
 
 #### Show rules
 
-Show-wide rules live in `xlights_mcp_rules.json` in the show folder. `create_sequence`
-reads the file on every run and the generator enforces it; a per-song setting that breaks
-a rule (such as a strobe outside the finale) is rejected with an error. All fields are
-optional:
+Show-wide rules live in `xlights_mcp_rules.json` in the show folder, split in two:
 
-| Field | Enforced as |
-|-------|-------------|
+- **`safety`** — applied by every write path: `create_sequence` in every mode,
+  `remap_sequence` (imported sequences) and `preview_plan`. Guided mode returns them with
+  its analysis so planned effects respect them.
+- **`style`** — the look of the show, applied by auto generation only.
+
+A per-song setting that breaks a rule (such as a strobe outside the finale) is rejected
+with an error. All fields are optional.
+
+| Safety field | Enforced as |
+|--------------|-------------|
 | `notes` | The rules in plain words (not used by the generator) |
-| `exclude` | Models or groups that never get effects |
+| `exclude` | Models or groups that never get effects. Imported sequences are never mapped onto them, or onto any group containing them |
+| `strobes` | Strobes only inside the finale (a section mark named `finale`, else the last run of peaks), every `every_beats` beats. In imported sequences, finale strobes are re-timed to that spacing and others removed; without the song's audio, all strobes are removed |
+| `white` | Whites are the listed `colors` plus anything paler than `max_saturation`. Every white is tinted to at least `min_tint` (neutral white gets a warm tint) and capped at `max_brightness`, except in `full_white_effects` (strobes) and the final hit, which may use `full_white`. No prop shows only white (all active colors white, or a one-color effect like On led by white) for more than `max_seconds` at a time or `max_share` of the song; offenders lead with a non-white color instead (or `fallback_colors` when the palette has none). Effects on part of a prop (one arch of the chase) don't count toward those limits |
+
+| Style field | Enforced as |
+|-------------|-------------|
+| `notes` | The rules in plain words |
 | `priorities` | `hero` / `key` / `normal` / `optional` per model or group, always applied; overrides `set_model_priority` |
-| `symmetry` | `pairs` of `[left, right]` props; `default` and `by_tier` modes: `mirror` (right side = left side flipped horizontally), `call_response` (motion and accents alternate sides bar by bar), `sync` (identical) |
+| `symmetry` | `pairs` of `[left, right]` **models** (group names are rejected); `default` and `by_tier` modes: `mirror` (right side = left side flipped horizontally), `call_response` (motion and accents alternate sides bar by bar), `sync` (identical). A pair of singers mirrors only its background bed |
 | `arch_chase` | Arch models listed left to right with their arch `count` (and `reverse` if wired right to left); their motion becomes one arch per beat, starting on the bar line, in every non-breather section |
-| `floods` | One solid color per section — never motion or accents |
+| `floods` | One solid color per section, stepping through the palette's non-white colors — never motion or accents |
 | `twinkle` | Props that only twinkle in the given `tiers` (intro/outro count as breathers) |
-| `final_hit` | Props kept dark until the final hit (the beat nearest the end of the last peak, or the per-song `final_hit`), then held for `bars` and faded |
-| `singing` | Which face models sing (`singers`), and the priorities to use while lyrics are unavailable (`without_lyrics`) |
-| `strobes` | Strobes only inside the finale (a section mark named `finale`, else the last run of peaks), every `every_beats` beats |
-| `palettes` | `core` palettes chosen by `by_model` → `by_section_label` → `by_tier` → `default` (plus `arch_chase`); per-song signature colors drawn from `accent_pool` go on secondary props at peaks, on every other hero accent hit (always paired with a core color) and on one featured section, capped at `max_accent_share` of effect time. Signatures are remembered per song in `xlights_mcp_signatures.json` so songs don't repeat them; `signature_colors` in a song's settings file overrides them |
+| `final_hit` | Props kept dark until the final hit, then held for `bars` and faded. The final hit is the per-song `final_hit`, else the beat nearest the end of the last peak, else (no peak) the strongest hit in the last 15 seconds |
+| `singing` | Which face models sing (`singers`). Each defaults to the vocal-stem track; if that transcription's mean word confidence is below `min_confidence` the song is treated as having no lyrics, and `without_lyrics` priorities apply. With `moments`, faces sing only in vocal feature moments: whole lyric phrases (split at silences over `phrase_gap_seconds`, at least `min_phrase_bars` long) where the vocal stem is at least `vocal_drum_ratio` × the drum stem and the drums are sparse (≤ `max_drum_onsets_per_beat`) or steady (inter-onset spread ≤ `max_drum_irregularity`), outside `avoid_tiers`, ending at least `peak_lead_bars` before any peak and (with `protect_builds`) before the build section leading into it — later phrases are trimmed off the moment and listed in the preview — loudest vocals first up to `max_share` of the song; phrases within `merge_gap_bars` sing as one moment. During a moment the other props keep their bed, lose accent hits and keep only `gentle_motion` (no chases), and floods hold their color; between moments singers use the `between_moments` priority. Without `moments`, singers sing the whole song |
+| `palettes` | `core` palettes chosen by `by_model` → `by_section_label` → `by_tier` → `default` (plus `arch_chase`); per-song signature colors drawn from `accent_pool` go on secondary props at peaks, on every other hero accent hit (always paired with a core color) and on one featured section, capped at `max_accent_share` of effect time. Each song gets a color set (a pair, with `signatures_per_song: 2`) that no other song in the show has — 28 pairs from 8 colors — remembered in `xlights_mcp_signatures.json`; `signature_colors` in a song's settings file overrides it but must also be unique |
+
+`preview_plan` runs exactly the generation `create_sequence` would (same settings, rules,
+lyrics and colors) without writing, and summarizes it per section and per rule. Both
+return a `plan_id`; matching ids mean the sequence will be the one previewed.
 
 ### Import a community sequence
 
@@ -429,7 +444,7 @@ The importer supports both standalone `.xsq` files and `.zip` packages (which in
 | Tool | Description |
 |------|-------------|
 | `create_sequence` | Generate a `.xsq` file from an `.mp3` with effects on all models |
-| `preview_plan` | Preview the generation plan (sections and their tiers) without writing a file |
+| `preview_plan` | Dry-run `create_sequence`: per-section tiers, symmetry, chase, floods, lit/dark props and accents, plus rule outcomes (including the chosen singing moments), with a `plan_id` that matches the sequence it previews |
 | `set_model_priority` | Mark models or groups as hero / key / normal / optional for generated sequences |
 
 ### Sequence Import & Remapping

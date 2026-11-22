@@ -19,6 +19,8 @@ Palettes cycle per phrase (every 2-4 bars) for variety, not just per section.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import logging
 import random
 from pathlib import Path
@@ -398,7 +400,7 @@ def _detect_model_groups(
                 grouped_names.update(m.name for m in members)
                 # Derive category from majority of member model categories
                 cats = [m.model_category for m in members]
-                group_categories[name] = max(set(cats), key=cats.count)
+                group_categories[name] = max(sorted(set(cats)), key=cats.count)
 
         if groups:
             ungrouped = [m for m in models if m.name not in grouped_names]
@@ -424,7 +426,7 @@ def _detect_model_groups(
             groups[group_key] = members
             grouped_names.update(m.name for m in members)
             cats = [m.model_category for m in members]
-            group_categories[group_key] = max(set(cats), key=cats.count)
+            group_categories[group_key] = max(sorted(set(cats)), key=cats.count)
 
     ungrouped = [m for m in models if m.name not in grouped_names]
     logger.info(f"Auto-detected {len(groups)} model groups by common prefix")
@@ -453,6 +455,30 @@ def _resolve_model_priorities(
     return resolved
 
 
+def _load_inputs(mp3_path: Path, show_path: Path | None):
+    """Show config, per-song settings and show rules, validated. Returns a dict on error."""
+    if not show_path or not show_path.exists():
+        return {"error": f"Show path not found: {show_path}"}
+    show_config = load_show_config(show_path)
+    if not show_config.models:
+        return {"error": "No models found in show configuration"}
+    try:
+        settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
+        if settings:
+            song_settings_mod.validate_models(settings, show_config)
+        rules, rules_path = show_rules_mod.load_show_rules(show_path)
+        if rules:
+            show_rules_mod.validate_models(rules, show_config)
+        if settings and settings.singing:
+            singing = rules.style.singing if rules else None
+            if not (singing and singing.moments):
+                raise ValueError("Song settings override 'singing', but the show rules define no singing.moments")
+            singing.moments_for(settings.singing)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return show_config, settings, settings_path, rules, rules_path
+
+
 def generate_sequence(
     mp3_path: Path,
     show_path: Path | None,
@@ -468,53 +494,40 @@ def generate_sequence(
     Args:
         vocal_assignments: Optional mapping of model_name → vocal track name.
             Use "all" as key to assign a track to all singing models.
-            If None and singing models exist, returns discovery info instead
-            of generating, so the caller can prompt the user.
+            If None, every singer uses the vocal-stem track.
         model_priorities: Optional mapping of model or group name → priority
             ("hero", "key", "normal", "optional").
     """
-    if not show_path or not show_path.exists():
-        return {"error": f"Show path not found: {show_path}"}
+    loaded = _load_inputs(mp3_path, show_path)
+    if isinstance(loaded, dict):
+        return loaded
+    show_config, settings, settings_path, rules, rules_path = loaded
 
-    show_config = load_show_config(show_path)
-    if not show_config.models:
-        return {"error": "No models found in show configuration"}
-
-    try:
-        settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
-        if settings:
-            song_settings_mod.validate_models(settings, show_config)
-        rules, rules_path = show_rules_mod.load_show_rules(show_path)
-        if rules:
-            show_rules_mod.validate_models(rules, show_config)
-    except ValueError as exc:
-        return {"error": str(exc)}
+    if mode not in ("auto", "guided", "template"):
+        return {"error": f"Invalid mode: {mode}"}
+    if mode == "template":
+        return {"error": "Template mode not yet implemented. Use 'auto' or 'guided'."}
 
     analysis = full_analysis(mp3_path, audio_config)
+    if mode == "guided":
+        return _generate_guided_preview(analysis, show_config, rules)
 
-    if mode == "auto":
-        try:
-            result = _generate_auto(
-                analysis, show_config, mp3_path, palette_hint, theme,
-                vocal_assignments=vocal_assignments,
-                model_priorities=model_priorities,
-                song_settings=settings,
-                show_rules=rules,
-            )
-        except ValueError as exc:  # a per-song setting breaks a show rule
-            return {"error": str(exc)}
-        if result.get("success"):
-            if settings_path:
-                result["song_settings"] = str(settings_path)
-            if rules_path:
-                result["show_rules"] = str(rules_path)
-        return result
-    elif mode == "guided":
-        return _generate_guided_preview(analysis, show_config)
-    elif mode == "template":
-        return {"error": "Template mode not yet implemented. Use 'auto' or 'guided'."}
-    else:
-        return {"error": f"Invalid mode: {mode}"}
+    try:
+        result = _generate_auto(
+            analysis, show_config, mp3_path, palette_hint, theme,
+            vocal_assignments=vocal_assignments,
+            model_priorities=model_priorities,
+            song_settings=settings,
+            show_rules=rules,
+        )
+    except ValueError as exc:  # a per-song setting breaks a show rule
+        return {"error": str(exc)}
+    if result.get("success"):
+        if settings_path:
+            result["song_settings"] = str(settings_path)
+        if rules_path:
+            result["show_rules"] = str(rules_path)
+    return result
 
 
 def preview_sequence_plan(
@@ -522,43 +535,126 @@ def preview_sequence_plan(
     show_path: Path | None,
     mode: str = "auto",
     audio_config: AudioConfig | None = None,
+    vocal_assignments: dict[str, str] | None = None,
+    model_priorities: dict[str, str] | None = None,
+    palette_hint: str | None = None,
+    theme: str | None = None,
 ) -> dict:
-    """Preview what a sequence would look like without generating."""
-    if not show_path or not show_path.exists():
-        return {"error": f"Show path not found: {show_path}"}
+    """Preview exactly what create_sequence would produce, without writing anything.
 
-    try:
-        settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
-    except ValueError as exc:
-        return {"error": str(exc)}
+    Runs the same generation (song settings, show rules, singing, palettes) and
+    summarizes it; ``plan_id`` matches the one create_sequence returns for the same inputs.
+    """
+    loaded = _load_inputs(mp3_path, show_path)
+    if isinstance(loaded, dict):
+        return loaded
+    show_config, settings, settings_path, rules, rules_path = loaded
+    if mode not in ("auto", "guided", "template"):
+        return {"error": f"Invalid mode: {mode}"}
+    if mode == "template":
+        return {"error": "Template mode not yet implemented. Use 'auto' or 'guided'."}
 
     analysis = full_analysis(mp3_path, audio_config)
-    show_config = load_show_config(show_path)
-    forced = None
-    if settings:
-        analysis, forced = song_settings_mod.apply_to_analysis(settings, analysis)
-    tiers = _rank_section_energy(analysis.sections, forced)
+    if mode == "guided":
+        return _generate_guided_preview(analysis, show_config, rules)
+    try:
+        plan = _generate_auto(
+            analysis, show_config, mp3_path, palette_hint, theme,
+            vocal_assignments=vocal_assignments, model_priorities=model_priorities,
+            song_settings=settings, show_rules=rules, write=False,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if "spec" not in plan:
+        return plan
+    summary = _summarize_plan(plan, show_config, rules)
+    return {
+        "song": mp3_path.stem,
+        "plan_id": plan["plan_id"],
+        "song_settings": str(settings_path) if settings_path else None,
+        "show_rules": str(rules_path) if rules_path else None,
+        "duration": f"{plan['analysis'].duration_seconds:.1f}s",
+        "tempo": f"{plan['analysis'].beats.tempo:.0f} BPM",
+        "beat_count": len(plan["analysis"].beats.beat_times),
+        **summary,
+    }
 
-    sections_summary = []
-    for s, tier in zip(analysis.sections, tiers):
-        sections_summary.append({
-            "label": s.label,
-            "tier": tier,
-            "start": f"{s.start_time:.1f}s",
-            "end": f"{s.end_time:.1f}s",
-            "duration": f"{s.duration:.1f}s",
-            "energy": f"{s.energy_level:.2f}",
+
+def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None) -> dict:
+    """Condense a dry-run plan into per-section and per-rule outcomes."""
+    spec, analysis, tiers = plan["spec"], plan["analysis"], plan["tiers"]
+    effects = spec.effects
+    sig = set(plan["signatures"])
+    excluded = sorted(show_rules_mod.excluded_models(rules, show_config)) if rules else []
+    style = rules.style if rules else None
+    arch_names = {a.model for a in style.arch_chase.arches} if style and style.arch_chase else set()
+    floods = set(song_settings_mod.expand_models(style.floods, show_config)) if style else set()
+    white = rules.safety.white if rules else None
+    hit_models = (set(song_settings_mod.expand_models(style.final_hit.models, show_config))
+                  if style and style.final_hit else set())
+
+    def overlaps(e, s):  # by at least 50 ms, so boundary slivers don't count
+        return min(e.end_time_ms, s.end_time_ms) - max(e.start_time_ms, s.start_time_ms) >= 50
+
+    sections = []
+    all_models = [m.name for m in show_config.models]
+    for i, s in enumerate(analysis.sections):
+        here = [e for e in effects if overlaps(e, s)]
+        lit = {e.model_name for e in here}
+        flood = next((e.palette.colors[0] for e in here
+                      if e.model_name in floods and e.palette and e.start_time_ms == s.start_time_ms), None)
+        sections.append({
+            "label": s.label, "tier": tiers[i],
+            "start": f"{s.start_time:.1f}s", "end": f"{s.end_time:.1f}s", "energy": f"{s.energy_level:.2f}",
+            "symmetry": (style.symmetry.by_tier.get(tiers[i], style.symmetry.default)
+                         if style and style.symmetry else None),
+            "arch_chase": any(e.model_name in arch_names and e.layer == 1 for e in here),
+            "flood_color": flood,
+            "props_lit": len(lit),
+            "props_dark": [m for m in all_models if m not in lit and m not in excluded],
+            "accent_props": sorted({e.model_name for e in here if e.palette and sig & set(e.palette.colors)}),
         })
 
+    strobes = sorted((e for e in effects if e.effect_name == "Strobe"), key=lambda e: e.start_time_ms)
+    starts = sorted({e.start_time_ms for e in strobes})
+    beat = 60 / max(analysis.beats.tempo, 1)
+    gaps = [(b - a) / 1000 / beat for a, b in zip(starts, starts[1:])]
+    full_moments = [e for e in effects if white and e.palette and white.full_white in e.palette.colors]
+    white_only: dict[str, float] = {}
+    if white:
+        for e in effects:
+            if e.model_name not in hit_models and e.effect_name not in white.full_white_effects \
+                    and show_rules_mod.shows_only_white(e, white.is_white):
+                white_only[e.model_name] = white_only.get(e.model_name, 0) + (e.end_time_ms - e.start_time_ms) / 1000
+
+    props = {}
+    for e in effects:
+        p = props.setdefault(e.model_name, {"effects": 0, "sections_lit": set()})
+        p["effects"] += 1
+        p["sections_lit"].update(i for i, s in enumerate(analysis.sections) if overlaps(e, s))
     return {
-        "song_settings": str(settings_path) if settings_path else None,
-        "song": mp3_path.stem,
-        "duration": f"{analysis.duration_seconds:.1f}s",
-        "tempo": f"{analysis.beats.tempo:.0f} BPM",
-        "beat_count": len(analysis.beats.beat_times),
-        "sections": sections_summary,
-        "models": len(show_config.models),
-        "controllers": len(show_config.controllers),
+        "total_effects": len(effects),
+        "models_with_effects": len(props),
+        "sections": sections,
+        "rules": {
+            "excluded": excluded,
+            "final_hit": ({"time": f"{plan['final_hit']:.2f}s", "models": sorted(hit_models)}
+                          if plan["final_hit"] is not None and hit_models else None),
+            "strobes": ({"models": sorted({e.model_name for e in strobes}),
+                         "start": f"{starts[0] / 1000:.2f}s", "end": f"{starts[-1] / 1000:.2f}s",
+                         "hits": len(starts),
+                         "spacing_beats": round(sorted(gaps)[len(gaps) // 2], 2) if gaps else None}
+                        if strobes else None),
+            "signature_colors": plan["signatures"],
+            "accent_share": plan["share"],
+            "full_white_moments": len(full_moments),
+            "white_only_seconds": {k: round(v, 2) for k, v in white_only.items()},
+            "lyrics": plan["lyrics"],
+            "vocal_assignments": plan["vocal_assignments"],
+            "singing": _moments_summary(plan["singing_moments"], analysis, plan["trimmed_phrases"]),
+        },
+        "props": {k: {"effects": v["effects"], "sections_lit": len(v["sections_lit"])}
+                  for k, v in sorted(props.items())},
     }
 
 
@@ -577,8 +673,12 @@ def _generate_auto(
     model_priorities: dict[str, str] | None = None,
     song_settings: SongSettings | None = None,
     show_rules: ShowRules | None = None,
+    write: bool = True,
 ) -> dict:
     """Professional-quality automatic sequence generation.
+
+    With ``write=False`` nothing is written; the plan (spec, tiers, rule outcomes and a
+    fingerprint matching the one create_sequence reports) is returned for preview_plan.
 
     Uses a 3-layer approach with model group synchronization:
       Layer 0: Background bed (twinkle, wash) — runs full section
@@ -604,7 +704,7 @@ def _generate_auto(
     if song_settings:
         analysis, forced_tiers = song_settings_mod.apply_to_analysis(song_settings, analysis)
 
-    rng = random.Random(hash(mp3_path.stem))  # deterministic per song
+    rng = random.Random(_stable_hash(mp3_path.stem))  # deterministic per song
 
     # Build palette pool
     theme_palettes = get_theme_palettes(theme)
@@ -631,11 +731,11 @@ def _generate_auto(
         logger.info(f"  Group '{gname}': {[m.name for m in members]}")
 
     priority_of = _resolve_model_priorities(model_priorities, show_config)
-    if show_rules and show_rules.priorities:  # show rules win over saved priorities
-        priority_of.update(_resolve_model_priorities(show_rules.priorities, show_config))
+    if show_rules and show_rules.style.priorities:  # show rules win over saved priorities
+        priority_of.update(_resolve_model_priorities(show_rules.style.priorities, show_config))
 
     # Identify singing models — the rules' singers, else normal-priority face models
-    singers = set(show_rules.singing.singers) if show_rules and show_rules.singing else None
+    singers = set(show_rules.style.singing.singers) if show_rules and show_rules.style.singing else None
     singing_models: dict[str, str] = {}  # model_name → face_definition_name
     for m in generic_models:
         if m.face_definitions and (
@@ -643,31 +743,34 @@ def _generate_auto(
         ):
             singing_models[m.name] = m.face_definitions[0]
 
-    # Without lyrics, singers run regular effects (with the rules' fallback priorities)
+    # Singers default to the vocal-stem track. Without usable lyrics — none found, or a
+    # low-confidence transcription — they run regular effects with the rules' fallbacks.
     vocal_tracks = _try_extract_vocal_tracks(mp3_path) if singing_models else []
+    min_conf = show_rules.style.singing.min_confidence if show_rules and show_rules.style.singing \
+        else DEFAULT_MIN_LYRIC_CONFIDENCE
+    lyrics_status = "no singers" if not singing_models else "no lyrics found"
+    if vocal_tracks:
+        default_track = next((t for t in vocal_tracks if t.source == "vocals_stem"), vocal_tracks[0])
+        lyrics_status = f"'{default_track.track_name}' confidence {default_track.confidence:.2f}"
+        if default_track.confidence < min_conf:
+            lyrics_status += f" < {min_conf:.2f}: treated as no faces"
+            vocal_tracks = []
+        elif vocal_assignments is None:
+            vocal_assignments = {"all": default_track.track_name}
     if singing_models and not vocal_tracks:
-        logger.info("Lyrics unavailable — singing models treated as regular models")
+        logger.info(f"Singing models treated as regular models ({lyrics_status})")
         singing_models = {}
-        if show_rules and show_rules.singing:
-            priority_of.update(_resolve_model_priorities(show_rules.singing.without_lyrics, show_config))
-    if singing_models and vocal_assignments is None:
-        return {
-            "needs_vocal_assignment": True,
-            "singing_models": [
-                {"model_name": n, "face_definition": f} for n, f in singing_models.items()
-            ],
-            "vocal_tracks": [
-                {"track_name": t.track_name, "source": t.source, "word_count": len(t.words)}
-                for t in vocal_tracks
-            ],
-            "message": (
-                "Singing face models and vocal tracks detected. "
-                "Please assign vocal tracks to models using the vocal_assignments parameter. "
-                "Pass a dict mapping model names to track names, "
-                'or use {"all": "<track_name>"} to assign one track to all singing models.'
-            ),
-        }
+        if show_rules and show_rules.style.singing:
+            priority_of.update(_resolve_model_priorities(show_rules.style.singing.without_lyrics, show_config))
     singing_model_names = set(singing_models)
+
+    # Singing moments: faces sing only in chosen vocal feature moments; in between they stay
+    # in the regular pipeline at the rules' between-moments priority (peaks only)
+    moments_cfg = (show_rules.style.singing.moments_for(song_settings.singing if song_settings else None)
+                   if show_rules and show_rules.style.singing else None)
+    if moments_cfg and singing_models:
+        priority_of.update({n: moments_cfg.between_moments for n in singing_models})
+        singing_model_names = set()
 
     # Remove singing models from groups and ungrouped lists
     for group_name in list(groups.keys()):
@@ -697,7 +800,7 @@ def _generate_auto(
 
     # Helper to generate effects for a model category and apply to a list of model names
     def generate_for_models(model_names: list[str], cat: str, group_seed: str):
-        group_rng = random.Random(hash(group_seed + mp3_path.stem))
+        group_rng = random.Random(_stable_hash(group_seed + mp3_path.stem))
         stem_data: StemAnalysis = analysis.stem_analysis
         priority = priority_of.get(model_names[0], "normal")  # groups are split by priority
 
@@ -707,7 +810,7 @@ def _generate_auto(
             if priority == "optional" and not is_peak:
                 continue
 
-            pal_idx = (sec_idx // 2 + hash(group_seed)) % len(palette_pool)
+            pal_idx = (sec_idx // 2 + _stable_hash(group_seed)) % len(palette_pool)
             palette = palette_pool[pal_idx]
 
             downbeats_in_section = section_downbeats.get(sec_idx, [])
@@ -938,15 +1041,22 @@ def _generate_auto(
                         start_time_ms=p.start_time_ms,
                         end_time_ms=p.end_time_ms,
                     ))
+                word_labels = _clean_labels(word_labels)
                 timing_tracks.append(TimingTrack(
                     name=lyric_track.track_name,
-                    labels=[word_labels, word_labels, phoneme_labels],
+                    labels=[word_labels, word_labels, _clean_labels(phoneme_labels)],
                 ))
 
             logger.info(f"Added {len(timing_tracks)} timing tracks to sequence")
 
-            # Place effects on singing models based on assignments
-            for model_name, face_def in singing_models.items():
+            # Each singer's timing track: its assignment, else the first (vocal-stem) track
+            face_tracks = {
+                n: resolved_assignments[n] if resolved_assignments.get(n) in track_lookup else vocal_tracks[0].track_name
+                for n in singing_models
+            }
+
+            # Whole-song faces, unless the rules limit singing to moments (placed later)
+            for model_name, face_def in (singing_models.items() if not moments_cfg else []):
                 assigned_track_name = resolved_assignments.get(model_name)
                 assigned_track = track_lookup.get(assigned_track_name) if assigned_track_name else None
 
@@ -956,7 +1066,7 @@ def _generate_auto(
                     assigned_track_name = assigned_track.track_name
                     logger.info(f"No assignment for '{model_name}', defaulting to '{assigned_track_name}'")
 
-                singing_rng = random.Random(hash(model_name + mp3_path.stem))
+                singing_rng = random.Random(_stable_hash(model_name + mp3_path.stem))
 
                 # Layer 0: Section-aware background that illuminates the whole model
                 for sec_idx, section in enumerate(analysis.sections):
@@ -1006,18 +1116,31 @@ def _generate_auto(
             )
 
     signatures: list[str] = []
-    share = None
+    share = finale = final_hit = None
+    singing_moments: list = []
+    trimmed_phrases: list = []
     if show_rules:
+        finale = show_rules_mod.finale_range(analysis, section_tiers, song_settings)
         final_hit = show_rules_mod.final_hit_time(analysis, section_tiers, song_settings)
+        # Style: roles, symmetry, arch chase
         all_effects = show_rules_mod.apply_structure(
             show_rules, all_effects, analysis, section_tiers, show_config, priority_of, final_hit,
             preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
         )
+        # Style: faces sing only in vocal feature moments; other props calm down meanwhile
+        if moments_cfg and has_lyrics and singing_models:
+            stem_track = next((t for t in vocal_tracks if t.source == "vocals_stem"), None)
+            singing_moments = show_rules_mod.pick_singing_moments(
+                stem_track.words if stem_track else [], analysis, section_tiers, moments_cfg,
+                trimmed=trimmed_phrases,
+            )
+            all_effects = show_rules_mod.apply_singing(
+                all_effects, singing_moments, singing_models, face_tracks, moments_cfg, show_config,
+                show_rules, preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
+            )
+        # Safety: strobes only in the finale, at the required spacing
         strobe_presets = {k for k in EFFECT_VARIANTS if _effect_name_from_key(k) == "Strobe"}
-        show_rules_mod.check_strobes(
-            show_rules, song_settings,
-            show_rules_mod.finale_range(analysis, section_tiers, song_settings), strobe_presets,
-        )
+        show_rules_mod.check_strobes(show_rules, song_settings, finale, strobe_presets)
 
     if song_settings and song_settings.effects:
         all_effects = song_settings_mod.apply_custom_effects(
@@ -1025,15 +1148,24 @@ def _generate_auto(
         )
 
     if show_rules:
+        # Safety: excluded models never get effects
         excluded = show_rules_mod.excluded_models(show_rules, show_config)
         all_effects = [e for e in all_effects if e.model_name not in excluded]
-        if show_rules.palettes:
+        # Style: weighted palettes and signature accents
+        if show_rules.style.palettes:
             signatures = show_rules_mod.pick_signatures(
                 show_rules, Path(show_config.show_path), mp3_path.stem,
                 song_settings.signature_colors if song_settings else None,
             )
             all_effects, share = show_rules_mod.apply_palettes(
                 show_rules, all_effects, analysis, section_tiers, show_config, priority_of, signatures,
+            )
+        if singing_moments:
+            all_effects = show_rules_mod.hold_floods(all_effects, singing_moments, show_rules, show_config)
+        # Safety: tinted, capped whites; full white only at full-white moments
+        if show_rules.safety.white:
+            all_effects = show_rules_mod.limit_white(
+                show_rules, all_effects, analysis.duration_ms, show_config,
             )
 
     # Build sequence spec
@@ -1044,6 +1176,16 @@ def _generate_auto(
         palettes=all_palettes, effects=all_effects,
         timing_tracks=timing_tracks,
     )
+    plan_id = _plan_fingerprint(spec)
+
+    if not write:  # preview: hand back the plan create_sequence would write
+        return {
+            "spec": spec, "plan_id": plan_id, "analysis": analysis, "tiers": section_tiers,
+            "finale": finale, "final_hit": final_hit, "signatures": signatures, "share": share,
+            "lyrics": lyrics_status, "priority_of": priority_of, "singing_moments": singing_moments,
+            "trimmed_phrases": trimmed_phrases,
+            "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
+        }
 
     # Write (never overwrite existing)
     base_name = mp3_path.stem
@@ -1076,8 +1218,11 @@ def _generate_auto(
         "timing_tracks": [t.name for t in timing_tracks],
         "singing_models": list(singing_models.keys()) if has_lyrics else [],
         "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
+        "lyrics": lyrics_status,
+        "singing_moments": _moments_summary(singing_moments, analysis, trimmed_phrases),
         "signature_colors": signatures,
         "accent_share": share,
+        "plan_id": plan_id,
         "message": f"Sequence created: {output_path.name}. Open in xLights to preview and render.",
     }
 
@@ -1087,8 +1232,14 @@ def _generate_auto(
 # ---------------------------------------------------------------------------
 
 
-def _generate_guided_preview(analysis: SongAnalysis, show_config: ShowConfig) -> dict:
-    """Return analysis for guided/interactive mode."""
+def _generate_guided_preview(
+    analysis: SongAnalysis, show_config: ShowConfig, rules: ShowRules | None = None,
+) -> dict:
+    """Return analysis for guided/interactive mode.
+
+    Excluded models are left out, and the show's safety rules are included so any
+    effects planned from this respect them.
+    """
     sections = []
     for i, s in enumerate(analysis.sections):
         sections.append({
@@ -1099,8 +1250,11 @@ def _generate_guided_preview(analysis: SongAnalysis, show_config: ShowConfig) ->
             "energy": f"{s.energy_level:.2f}",
         })
 
+    excluded = show_rules_mod.excluded_models(rules, show_config)
     models_by_category = {}
     for m in show_config.models:
+        if m.name in excluded:
+            continue
         cat = m.model_category
         models_by_category.setdefault(cat, []).append(m.name)
 
@@ -1114,6 +1268,7 @@ def _generate_guided_preview(analysis: SongAnalysis, show_config: ShowConfig) ->
         },
         "sections": sections,
         "models_by_category": models_by_category,
+        "safety_rules": rules.safety.model_dump(exclude_none=True) if rules else None,
     }
 
 
@@ -1162,7 +1317,51 @@ def _effect_name_from_key(variant_key: str) -> str:
     return key_to_effect.get(variant_key, variant_key.split("_")[0])
 
 
+def _moments_summary(moments: list, analysis: SongAnalysis, trimmed: list | None = None) -> dict:
+    total = sum(m.end - m.start for m in moments)
+    return {
+        "trimmed_phrases": [
+            {"start": f"{t.start:.2f}s", "end": f"{t.end:.2f}s", "reason": t.reason, "lyrics": t.lyrics}
+            for t in trimmed or []
+        ],
+        "share": round(total / max(analysis.duration_seconds, 1e-6), 3),
+        "moments": [
+            {"start": f"{m.start:.2f}s", "end": f"{m.end:.2f}s", "seconds": round(m.end - m.start, 2),
+             "vocal_drum_ratio": m.vocal_drum_ratio, "lyrics": m.lyrics}
+            for m in moments
+        ],
+    }
+
+
+def _plan_fingerprint(spec: SequenceSpec) -> str:
+    """Order-independent fingerprint of a sequence's effects and timing tracks."""
+    rows = sorted(
+        (e.model_name, e.layer, e.effect_name, e.start_time_ms, e.end_time_ms,
+         sorted(e.settings.items()), e.palette.to_xlights_string() if e.palette else "")
+        for e in spec.effects
+    )
+    rows.append(sorted(t.name for t in spec.timing_tracks))
+    return hashlib.sha1(json.dumps(rows, default=str).encode()).hexdigest()[:12]
+
+
+def _stable_hash(text: str) -> int:
+    """A hash that's the same in every process (built-in hash() is salted per process)."""
+    return int(hashlib.md5(text.encode()).hexdigest()[:12], 16)
+
+
 DRUM_SNAP_SECONDS = 0.06
+DEFAULT_MIN_LYRIC_CONFIDENCE = 0.5
+
+
+def _clean_labels(labels: list[TimingTrackLabel]) -> list[TimingTrackLabel]:
+    """Sort timing labels, drop empty or inverted ones and clip each to the next start."""
+    labels = sorted((lb for lb in labels if lb.end_time_ms > lb.start_time_ms), key=lambda lb: lb.start_time_ms)
+    out: list[TimingTrackLabel] = []
+    for i, lb in enumerate(labels):
+        end = min(lb.end_time_ms, labels[i + 1].start_time_ms) if i + 1 < len(labels) else lb.end_time_ms
+        if end > lb.start_time_ms:
+            out.append(lb.model_copy(update={"end_time_ms": end}))
+    return out
 
 
 def _snap_to_onsets(times: list[float], onsets: list[float]) -> list[float]:
@@ -1212,23 +1411,41 @@ def _try_extract_lyrics(mp3_path: Path):
         return None
 
 
+LYRICS_CACHE_VERSION = 1
+
+
 def _try_extract_vocal_tracks(mp3_path: Path) -> list:
-    """Try to extract all vocal timing tracks. Returns empty list if unavailable."""
+    """Extract all vocal timing tracks (cached per audio file). Empty list if unavailable.
+
+    Transcriptions are cached so a preview and the sequence it previews see the same
+    lyrics — Whisper can transcribe the same audio differently from run to run.
+    """
+    from xlights_mcp.audio.lyrics import LyricTrack
+    from xlights_mcp.config import AUDIO_CACHE_DIR
+
+    try:
+        st = mp3_path.stat()
+        key = hashlib.sha1(f"{mp3_path.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
+        cache = AUDIO_CACHE_DIR / f"lyrics-v{LYRICS_CACHE_VERSION}-{key}.json"
+    except OSError:
+        cache = None
+    if cache and cache.exists():
+        try:
+            return [LyricTrack.model_validate(t) for t in json.loads(cache.read_text())]
+        except (ValueError, OSError):
+            pass
+
     try:
         from xlights_mcp.audio.lyrics import extract_vocal_tracks
-        tracks = extract_vocal_tracks(mp3_path, whisper_model="base")
-        return [t for t in tracks if t.available and t.phonemes]
-    except ImportError:
-        logger.info("Whisper not installed — skipping vocal track extraction")
-        # Fall back to single-track extraction
-        track = _try_extract_lyrics(mp3_path)
-        if track and track.available and track.phonemes:
-            return [track]
-        return []
+        tracks = [t for t in extract_vocal_tracks(mp3_path, whisper_model="base") if t.available and t.phonemes]
     except Exception as e:
         logger.warning(f"Vocal track extraction failed: {e}")
-        # Fall back to single-track extraction
         track = _try_extract_lyrics(mp3_path)
-        if track and track.available and track.phonemes:
-            return [track]
-        return []
+        tracks = [track] if track and track.available and track.phonemes else []
+    if cache and tracks:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps([t.model_dump(mode="json") for t in tracks]))
+        except OSError:
+            pass
+    return tracks

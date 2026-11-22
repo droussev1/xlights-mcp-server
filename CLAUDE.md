@@ -6,13 +6,22 @@ The active show's sequencing rules live in its show folder, not in this repo:
 
 **`/Volumes/Personal-Drive/XLIGHTS/XMAS_2026/xlights_mcp_rules.json`**
 
-`create_sequence` reads it on every run and the generator enforces it
-(`src/xlights_mcp/sequencer/show_rules.py`). Its `notes` list states the rules in
-plain words; the other fields are what the generator acts on. Read it before
-planning or generating a sequence, and treat it as the source of truth:
+It has two parts, each with a `notes` list stating the rules in plain words:
+
+- **`safety`** (TUNE_TO_90.1 exclusion, white/brightness cap, strobe limit) — enforced on
+  every write path: `create_sequence` in all modes, `preview_plan`, and `remap_sequence`
+  (`src/xlights_mcp/sequencer/xsq_safety.py` for imported sequences). Guided-mode output
+  includes them; respect them when planning effects by hand.
+- **`style`** (everything else) — applied by auto generation only
+  (`src/xlights_mcp/sequencer/show_rules.py`).
+
+Read it before planning or generating a sequence, and treat it as the source of truth:
 
 - When the user states a new show-wide rule, add it to the rules file (`notes` plus the
-  structured field) and make sure the generator enforces it — not just this file.
+  structured field, under `safety` if it protects people or hardware, else `style`) and
+  make sure the generator enforces it — not just this file.
+- Run `preview_plan` before `create_sequence` when the user wants to review a plan; the
+  two `plan_id`s match when the written sequence is the one previewed.
 - Don't hardcode show-specific model names in the code; reference them from the rules file.
 - A per-song setting that breaks a rule (e.g. a strobe outside the finale) makes
   `create_sequence` return an error — fix the song settings, don't bypass the check.

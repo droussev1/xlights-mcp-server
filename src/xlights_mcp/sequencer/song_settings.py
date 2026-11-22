@@ -12,6 +12,7 @@ All fields are optional:
       ],
       "signature_colors": ["#7B2FBE"], # this song's accent colors (overrides the show's pick)
       "final_hit": 113.0,              # seconds; overrides the detected final hit
+      "singing": {"vocal_drum_ratio": 2.5, "max_share": 0.3},  # singing-moment overrides
       "effects": [                     # custom effects, replacing generated ones on the
         {                              # same models/layer within their time range
           "section": "climax",         # a mark name, or "start"/"end" in seconds
@@ -91,6 +92,7 @@ class SongSettings(BaseModel):
     effects: list[CustomEffect] = Field(default_factory=list)
     signature_colors: list[str] | None = Field(default=None, min_length=1, max_length=2)
     final_hit: float | None = None  # seconds; overrides the detected final hit
+    singing: dict | None = None  # overrides for the show's singing-moment settings
 
     @field_validator("signature_colors")
     @classmethod
