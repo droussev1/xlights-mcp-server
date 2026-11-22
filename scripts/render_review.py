@@ -7,8 +7,9 @@ BatchVideoExport.lua: openSequence → renderAll → exportVideoPreview → clos
     uv run python scripts/render_review.py "<show>/07 Winter Wonderland (generated 1).xsq" \\
         --at 5.2 11.6 50.0 85.3 93.0 --out "<show>/renders"
 
-Writes <out>/<sequence>.mp4, one PNG per --at time, and <sequence>-sheet.png (all frames
-tiled with their times) for review.
+Writes <out>/<sequence>.mp4, one PNG per --at time (the time is in the file name), and
+<sequence>-sheet.png (all frames tiled in --at order, left to right, top to bottom). The
+video is the size of xLights' House Preview pane; enlarge it for sharper frames.
 """
 
 from __future__ import annotations
@@ -43,14 +44,16 @@ def main() -> int:
     ap.add_argument("sequence", type=Path)
     ap.add_argument("--at", type=float, nargs="*", default=[], help="seconds to grab frames at")
     ap.add_argument("--out", type=Path, required=True, help="folder xLights may write to (e.g. <show>/renders)")
+    ap.add_argument("--frames-only", action="store_true", help="reuse an exported video")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     video = args.out / f"{args.sequence.stem}.mp4"
 
-    print(command("openSequence", seq=args.sequence, promptIssues=False))
-    print(command("renderAll", highdef=False))
-    print(command("exportVideoPreview", filename=video))
-    print(command("closeSequence", quiet=True, force=True))
+    if not args.frames_only:
+        print(command("openSequence", seq=args.sequence, promptIssues=False))
+        print(command("renderAll", highdef=False))
+        print(command("exportVideoPreview", filename=video))
+        print(command("closeSequence", quiet=True, force=True))
     if not video.exists():
         print(f"No video at {video}", file=sys.stderr)
         return 1
@@ -59,7 +62,6 @@ def main() -> int:
     for t in args.at:
         png = args.out / f"{args.sequence.stem}-{t:07.2f}.png"
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t}", "-i", str(video), "-frames:v", "1",
-                        "-vf", f"drawtext=text='{t:.2f}s':x=10:y=10:fontsize=28:fontcolor=white:box=1:boxcolor=black",
                         str(png)], check=True)
         frames.append(png)
     if frames:
@@ -68,7 +70,7 @@ def main() -> int:
         inputs = [x for f in frames for x in ("-i", str(f))]
         rows = -(-len(frames) // cols)
         subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex",
-                        f"{''.join(f'[{i}:v]scale=640:-1[v{i}];' for i in range(len(frames)))}"
+                        f"{''.join(f'[{i}:v]scale=-2:520[v{i}];' for i in range(len(frames)))}"
                         f"{''.join(f'[v{i}]' for i in range(len(frames)))}xstack=inputs={len(frames)}:"
                         f"layout={'|'.join(_cell(i % cols, 'w0') + '_' + _cell(i // cols, 'h0') for i in range(len(frames)))}:fill=black",
                         str(sheet)], check=True)
