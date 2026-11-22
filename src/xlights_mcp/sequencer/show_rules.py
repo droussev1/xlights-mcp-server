@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from xlights_mcp.audio.analyzer import SongAnalysis
 from xlights_mcp.sequencer.song_settings import (
-    ArchPattern, DesignBrief, SongSettings, Tier, clip_out, expand_models,
+    ArchPattern, DesignBrief, Look, SongSettings, Tier, clip_out, expand_models,
 )
 from xlights_mcp.xlights.models import ShowConfig
 from xlights_mcp.xlights.palettes import ColorPalette
@@ -266,11 +266,44 @@ def _hsv(color: str) -> tuple[float, float, float]:
     return colorsys.rgb_to_hsv(*(int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)))
 
 
+SIGN_FORBIDDEN_EFFECTS = {"Strobe", "Shimmer", "Twinkle", "Off", "VU Meter", "Music", "Fireworks",
+                          "Lightning", "Faces", "Life", "Meteors", "Snowflakes", "Snowstorm"}
+
+
+class Sign(_Strict):
+    """A sign that must stay lit and readable: exactly one effect per song, from the first
+    frame to the last, chosen from ``looks`` (a different one from the songs next to it in
+    show order), in its own ``colors`` — never the song's palette — and never touched by
+    anything else: no beat or audio reaction, no moments, cues or blackouts, no layers.
+    Looks that can go dark, flash or follow the music aren't allowed."""
+
+    model: str
+    looks: dict[str, Look] = Field(min_length=1)
+    colors: list[str] = Field(min_length=1)
+
+    @field_validator("colors")
+    @classmethod
+    def _sign_colors(cls, v):
+        return _hex(v)
+
+    @field_validator("looks")
+    @classmethod
+    def _steady_looks(cls, v):
+        for name, look in v.items():
+            if look.effect in SIGN_FORBIDDEN_EFFECTS:
+                raise ValueError(f"sign look '{name}': {look.effect} can go dark or flash")
+            music = [k for k, x in look.settings.items() if "music" in k.lower() and x not in (False, 0, "0")]
+            if music:
+                raise ValueError(f"sign look '{name}' reacts to the music ({', '.join(music)})")
+        return v
+
+
 class SafetyRules(_Strict):
     """Rules every write path enforces: auto, guided, template and remap_sequence."""
 
     notes: list[str] = Field(default_factory=list)  # the rules in plain words
     exclude: list[str] = Field(default_factory=list)
+    sign: Sign | None = None
     white: WhiteLimit | None = None
     strobes: Strobes | None = None
 
@@ -280,6 +313,7 @@ class StyleRules(_Strict):
 
     notes: list[str] = Field(default_factory=list)
     priorities: dict[str, Priority] = Field(default_factory=dict)
+    hands_off: list[str] = Field(default_factory=list)  # models the generator and briefs never add effects to
     symmetry: Symmetry | None = None
     arch_chase: ArchChase | None = None
     variety: Variety | None = None
@@ -296,6 +330,12 @@ class StyleRules(_Strict):
 class ShowRules(_Strict):
     safety: SafetyRules = Field(default_factory=SafetyRules)
     style: StyleRules = Field(default_factory=StyleRules)
+
+    @model_validator(mode="after")
+    def _sign_is_not_excluded(self):
+        if self.safety.sign and self.safety.sign.model in self.safety.exclude:
+            raise ValueError(f"'{self.safety.sign.model}' can't be both the sign (always lit) and excluded")
+        return self
 
     def model_names(self) -> list[str]:
         names = [*self.safety.exclude, *self.style.floods, *self.style.priorities]
@@ -356,8 +396,36 @@ def generic_skip(rules: ShowRules | None, show_config: ShowConfig) -> set[str]:
     """Models the generic generator should leave alone because the rules own them."""
     if not rules:
         return set()
-    names = [*rules.safety.exclude, *rules.style.floods, *(rules.style.final_hit.models if rules.style.final_hit else [])]
+    names = [*rules.safety.exclude, *rules.style.floods, *rules.style.hands_off,
+             *(rules.style.final_hit.models if rules.style.final_hit else []),
+             *([rules.safety.sign.model] if rules.safety.sign else [])]
     return set(expand_models(names, show_config))
+
+
+def pick_sign(rules: ShowRules, show_path: Path, song: str, used: str | None = None) -> str | None:
+    """This song's sign look: its ledger entry's if still allowed, else one its neighbors
+    in show order don't use, picked per song."""
+    sign = rules.safety.sign
+    if not sign:
+        return None
+    designs = _read_designs(show_path)
+    known = {**{s: [] for s in _read_registry(show_path)}, **designs}
+    taken = {designs[s].get("sign_effect") for s in adjacent_songs(song, known) if s in designs}
+    options = [n for n in sign.looks if n not in taken] or list(sign.looks)
+    mine = used or designs.get(song, {}).get("sign_effect")
+    if mine in options:
+        return mine
+    return options[int(hashlib.md5(song.encode()).hexdigest(), 16) % len(options)]
+
+
+def sign_effect(rules: ShowRules, look_name: str, duration_ms: int) -> EffectPlacement:
+    """The sign's one effect for the whole song, in the sign's own colors."""
+    from xlights_mcp.xlights.effect_catalog import effect_settings
+    sign = rules.safety.sign
+    look = sign.looks[look_name]
+    return EffectPlacement(model_name=sign.model, layer=0, effect_name=look.effect, start_time_ms=0,
+                           end_time_ms=duration_ms, settings=effect_settings(look.effect, look.settings),
+                           palette=_palette(sign.colors))
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +641,8 @@ def apply_structure(
 
     # Twinkle props: only twinkle in their tiers (intro/outro are breathers)
     if rules.style.twinkle:
-        names = expand_models(rules.style.twinkle.models, show_config)
+        untouchable = protected_models(rules, show_config)
+        names = [n for n in expand_models(rules.style.twinkle.models, show_config) if n not in untouchable]
         tw_name, tw_settings = preset("Twinkle_ambient")
         for i, s in enumerate(sections):
             if tiers[i] in rules.style.twinkle.tiers:
@@ -609,9 +678,11 @@ def apply_structure(
 
 
 def protected_models(rules: ShowRules, show_config: ShowConfig) -> set[str]:
-    """Models a brief's moments and cues can't take over: floods, final-hit props, excluded."""
-    names = [*rules.safety.exclude, *rules.style.floods,
-             *(rules.style.final_hit.models if rules.style.final_hit else [])]
+    """Models a brief's moments, cues and clicks can't take over: floods, final-hit props,
+    excluded models, the sign and hands-off models."""
+    names = [*rules.safety.exclude, *rules.style.floods, *rules.style.hands_off,
+             *(rules.style.final_hit.models if rules.style.final_hit else []),
+             *([rules.safety.sign.model] if rules.safety.sign else [])]
     return set(expand_models(names, show_config))
 
 
@@ -766,6 +837,7 @@ class Design:
     lyric_cues: list[str] = field(default_factory=list)  # "word@time"
     faces: bool = False
     hero_families: list[str] = field(default_factory=list)
+    sign_effect: str | None = None
 
 
 def _read_designs(show_path: Path) -> dict[str, dict]:
@@ -782,7 +854,7 @@ def record_design(show_path: Path, song: str, design: Design) -> None:
                      "hero_families": design.hero_families,
                      "arch_pattern": design.arch_pattern, "signature_moment": design.signature_moment,
                      "signature": design.signature, "secondary_moments": design.secondary_moments,
-                     "lyric_cues": design.lyric_cues, "faces": design.faces}
+                     "lyric_cues": design.lyric_cues, "faces": design.faces, "sign_effect": design.sign_effect}
     (show_path / DESIGNS_FILENAME).write_text(json.dumps({"songs": designs}, indent=2) + "\n")
 
 
@@ -1105,7 +1177,7 @@ def apply_singing(
     gentle = [preset(k) for k in cfg.gentle_motion]
     hit_models = set(expand_models(rules.style.final_hit.models, show_config)) if rules.style.final_hit else set()
     yard_hits = bool(rules.style.final_hit and rules.style.final_hit.overrides_calm_bed and final_hit is not None)
-    skip = set(expand_models([*rules.style.floods, *rules.safety.exclude], show_config))
+    skip = protected_models(rules, show_config)
     bed_name, bed_settings = preset("ColorWash_slow")
     for m in moments:
         lo, hi = int(m.start * 1000), int(m.end * 1000)

@@ -649,6 +649,7 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
                         if strobes else None),
             "signature_colors": plan["signatures"],
             "design": plan["design"],
+            "sign": plan["sign"],
             "faces": plan["faces"],
             "style_fixes": plan["style_fixes"],
             "accent_share": plan["share"],
@@ -779,6 +780,21 @@ def _generate_core(
     brief = song_settings.brief if song_settings else None
     if brief:
         _validate_brief(brief)
+    hands_off = set(song_settings_mod.expand_models(show_rules.style.hands_off, show_config)) \
+        if show_rules else set()
+    brief_allowed: set[str] = set()
+    if brief and hands_off:
+        allowed = set(song_settings_mod.expand_models(brief.allow_models, show_config)) if brief.allow_models else set()
+        named = [*(n for ns in brief.stems.values() for n in ns),
+                 *(n for c in brief.clicks for n in c.models),
+                 *(n for c in brief.lyric_cues for n in c.models),
+                 *(n for m in [brief.signature_moment, *brief.secondary_moments] if m for n in m.models)]
+        direct = sorted({n for n in named if n in hands_off - allowed})
+        if direct:
+            raise ValueError(f"The brief uses {', '.join(direct)}, which the show rules keep hands-off "
+                             "unless the owner asks for it in this song (brief allow_models)")
+        hands_off -= allowed
+        brief_allowed = allowed
     if show_rules and song_settings:  # nothing the show avoids (strobes, plain washes...)
         used = [(f"Brief look '{n}'", name, fx) for n, (name, fx) in _ACTIVE_LOOKS.items()]
         for k in [*(k for keys in (brief.effects.values() if brief else []) for k in keys),
@@ -802,6 +818,10 @@ def _generate_core(
         design = show_rules_mod.pick_design(show_rules, Path(show_config.show_path), mp3_path.stem, brief, hero_pool,
                                             show_size=len({f.stem for f in audio}), show_config=show_config,
                                             family=_effect_name_from_key)
+    sign_look = show_rules_mod.pick_sign(show_rules, Path(show_config.show_path), mp3_path.stem) \
+        if show_rules else None
+    if design:
+        design.sign_effect = sign_look
     hero_effects = design.hero_effects if design else (brief.hero_effects if brief else [])
     flowing = bool(brief and brief.motion == "flowing")
     # Negative space: which sections fill (peaks, and swells of the brief's fill stem)
@@ -1300,7 +1320,7 @@ def _generate_core(
                 room = max(int(cal.max_hits_per_minute * analysis.duration_seconds / 60) - at_hit, 0)
             all_effects, clicks_placed, click_ids = _place_clicks(
                 brief, all_effects, analysis, show_config, section_tiers, stem_levels, singing_moments,
-                show_rules_mod.protected_models(show_rules, show_config) | set(singing_models),
+                (show_rules_mod.protected_models(show_rules, show_config) - brief_allowed) | set(singing_models),
                 pairs=[tuple(x) for x in show_rules.style.symmetry.pairs] if show_rules.style.symmetry else [],
                 max_clicks=room)
         # Style: keep accent hits (and clicks) within the show's calibrated budget
@@ -1312,6 +1332,8 @@ def _generate_core(
         show_rules_mod.check_strobes(show_rules, song_settings, finale, strobe_presets)
 
     protected = show_rules_mod.protected_models(show_rules, show_config) if show_rules else set()
+    hands_off_all = set(song_settings_mod.expand_models(show_rules.style.hands_off, show_config)) \
+        if show_rules else set()
     singing_windows = {n: [(int(m.start * 1000), int(m.end * 1000)) for m in singing_moments]
                        for n in singing_models}
     if brief and brief.clicks and not show_rules:
@@ -1321,7 +1343,7 @@ def _generate_core(
     if song_settings and (song_settings.all_effects or cue_effects):
         all_effects = song_settings_mod.apply_custom_effects(
             song_settings, all_effects, analysis, show_config, palette_pool, extra=cue_effects,
-            protected=protected, busy=singing_windows,
+            protected=protected - hands_off_all, busy=singing_windows, hands_off=hands_off - brief_allowed,
             pairs=[tuple(x) for x in show_rules.style.symmetry.pairs] if show_rules and show_rules.style.symmetry else None,
         )
 
@@ -1347,6 +1369,12 @@ def _generate_core(
             )
         if singing_moments:
             all_effects = show_rules_mod.hold_floods(all_effects, singing_moments, show_rules, show_config)
+        # Safety: the sign gets exactly one effect for the whole song, and nothing else
+        if show_rules.safety.sign:
+            sign_name = show_rules.safety.sign.model
+            all_effects = [e for e in all_effects if e.model_name != sign_name]
+            if sign_name in {m.name for m in show_config.models}:
+                all_effects.append(show_rules_mod.sign_effect(show_rules, sign_look, analysis.duration_ms))
         # Safety: tinted, capped whites; full white only at full-white moments
         if show_rules.safety.white:
             all_effects = show_rules_mod.limit_white(
@@ -1367,6 +1395,8 @@ def _generate_core(
         return {
             "spec": spec, "plan_id": plan_id, "analysis": analysis, "tiers": section_tiers,
             "finale": finale, "final_hit": final_hit, "signatures": signatures, "share": share,
+            "sign": {"model": show_rules.safety.sign.model, "look": sign_look}
+                    if show_rules and show_rules.safety.sign else None,
             "design": _design_summary(brief, design, stem_of, song_settings, cue_effects), "style_fixes": {
                 **style_fixes, "hits_over_budget_dropped": hits_dropped, "clicks": clicks_placed},
             "faces": bool(singing_models),
@@ -1377,14 +1407,17 @@ def _generate_core(
 
     # Write (never overwrite existing)
     base_name = mp3_path.stem
-    output_path = Path(show_config.show_path) / f"{base_name}.xsq"
+    show_dir = Path(show_config.show_path)
+    archive = show_dir / ARCHIVE_DIR
+    output_path = show_dir / f"{base_name}.xsq"
     if output_path.exists():
         counter = 1
-        while output_path.exists():
-            output_path = Path(show_config.show_path) / f"{base_name} (generated {counter}).xsq"
+        while output_path.exists() or (archive / output_path.name).exists():
+            output_path = show_dir / f"{base_name} (generated {counter}).xsq"
             counter += 1
 
     write_xsq(spec, show_config, output_path)
+    archived = _archive_drafts(show_dir, base_name, keep=output_path)
     if signatures:
         show_rules_mod.record_signatures(Path(show_config.show_path), mp3_path.stem, signatures)
     if design:
@@ -1394,6 +1427,7 @@ def _generate_core(
 
     return {
         "success": True,
+        "archived_drafts": archived,
         "output_path": str(output_path),
         "song": mp3_path.stem,
         "duration": f"{analysis.duration_seconds:.1f}s",
@@ -1584,6 +1618,24 @@ def _stable_hash(text: str) -> int:
 
 
 DRUM_SNAP_SECONDS = 0.06
+ARCHIVE_DIR = "archive"
+
+
+def _archive_drafts(show_dir: Path, base_name: str, keep: Path) -> list[str]:
+    """Move this song's earlier generated drafts ("<song> (generated N)", with their .fseq)
+    into the show's archive folder once a newer one is written. Never touches "<song>.xsq"."""
+    import re
+    import shutil
+    pattern = re.compile(rf"^{re.escape(base_name)} \(generated \d+\)\.(xsq|fseq)$")
+    moved = []
+    for f in sorted(show_dir.iterdir()):
+        if f.is_file() and pattern.match(f.name) and f.stem != keep.stem:
+            (show_dir / ARCHIVE_DIR).mkdir(exist_ok=True)
+            target = show_dir / ARCHIVE_DIR / f.name
+            if not target.exists():
+                shutil.move(str(f), target)
+                moved.append(f.name)
+    return moved
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"}
 CUE_SNAP_SECONDS = 0.15  # a cue's time must be this close to its word's transcribed start
 

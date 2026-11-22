@@ -9,6 +9,8 @@ written straight from their XML, so the same rules are applied to the tree here:
   the show's Music folder matching it by title. Without either, every strobe is removed
 - whites are tinted and capped, white-only looks are limited, and full white is kept
   only in strobes
+- the sign gets exactly one effect for the whole song (its own look and colors), and
+  groups containing it lose their effects so nothing else lands on it
 """
 
 from __future__ import annotations
@@ -59,10 +61,12 @@ def find_matching_audio(titles: list[str | None], folders: list[Path]) -> Path |
 
 
 def unsafe_targets(rules: ShowRules, show_config: ShowConfig) -> set[str]:
-    """Excluded models plus every group that (directly or through subgroups) contains one."""
+    """Excluded models, plus every group that (directly or through subgroups) contains an
+    excluded model or the sign."""
     excluded = set(expand_models(rules.safety.exclude, show_config))
+    shielded = excluded | ({rules.safety.sign.model} if rules.safety.sign else set())
     groups = {g.name for g in show_config.model_groups
-              if excluded & set(expand_models([g.name], show_config))}
+              if shielded & set(expand_models([g.name], show_config))}
     return excluded | groups
 
 
@@ -103,6 +107,8 @@ def apply_safety(
                 warnings.append(f"Safety rules: dropped effects on '{el.get('name')}' (excluded)")
             container.remove(el)
 
+    if rules.safety.sign:
+        warnings += _apply_sign(root, rules, show_config)
     if rules.safety.strobes:
         warnings += _limit_strobes(root, rules, analysis, tiers)
     if rules.safety.white:
@@ -217,3 +223,35 @@ def _limit_white(root, rules: ShowRules) -> list[str]:
         warnings.append(f"Safety rules: softened whites in {changed} effect(s)"
                         + (f", recolored {recolored} long white-only look(s)" if recolored else ""))
     return warnings
+
+
+def _apply_sign(root: etree._Element, rules: ShowRules, show_config: ShowConfig) -> list[str]:
+    """Give the sign exactly one effect, from the first frame to the last."""
+    from xlights_mcp.sequencer.show_rules import pick_sign, sign_effect
+    name = rules.safety.sign.model
+    if name not in {m.name for m in show_config.models}:
+        return []
+    song = (root.findtext("head/song") or "").strip()
+    duration_ms = int(round(float(root.findtext("head/sequenceDuration") or 0) * 1000))
+    look = pick_sign(rules, Path(show_config.show_path), song)
+    eff = sign_effect(rules, look, duration_ms)
+    db = root.find("EffectDB") if root.find("EffectDB") is not None else etree.SubElement(root, "EffectDB")
+    palettes = root.find("ColorPalettes") if root.find("ColorPalettes") is not None \
+        else etree.SubElement(root, "ColorPalettes")
+    etree.SubElement(db, "Effect").text = ",".join(f"{k}={v}" for k, v in sorted(eff.settings.items()))
+    etree.SubElement(palettes, "ColorPalette").text = eff.palette.to_xlights_string()
+    effects = root.find("ElementEffects")
+    if effects is None:
+        effects = etree.SubElement(root, "ElementEffects")
+    had = 0
+    for el in [el for el in effects if el.get("type") == "model" and el.get("name") == name]:
+        had += len(el.findall("EffectLayer/Effect"))
+        effects.remove(el)
+    el = etree.SubElement(effects, "Element", type="model", name=name)
+    etree.SubElement(etree.SubElement(el, "EffectLayer"), "Effect", ref=str(len(db) - 1), name=eff.effect_name,
+                     startTime="0", endTime=str(duration_ms), palette=str(len(palettes) - 1))
+    display = root.find("DisplayElements")
+    if display is not None and not any(d.get("name") == name for d in display):
+        etree.SubElement(display, "Element", collapsed="0", type="model", name=name, visible="1")
+    return [f"Safety rules: '{name}' gets one '{look}' effect for the whole song"
+            + (f" (replaced {had} imported effect{'s' if had != 1 else ''})" if had else "")]

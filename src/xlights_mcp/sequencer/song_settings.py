@@ -106,6 +106,7 @@ class SignatureMoment(CustomEffect):
     others: str | None = None
     stagger: Literal["center_out", "left_to_right"] | None = None
     stagger_share: float = Field(default=0.75, gt=0, le=1)  # of the moment the starts spread over
+    exclusive: bool = False  # own its props on every layer (nothing shows through under it)
 
 
 class LyricCue(BaseModel):
@@ -174,6 +175,7 @@ class DesignBrief(BaseModel):
     colors: str = ""  # color direction, in words
     looks: dict[str, Look] = Field(default_factory=dict)  # named looks, usable like presets
     faces: bool = False  # faces sing only when the brief says so
+    allow_models: list[str] = Field(default_factory=list)  # hands-off models the owner asked to use here
     lyric_cues: list[LyricCue] = Field(default_factory=list)
     secondary_moments: list[SignatureMoment] = Field(default_factory=list)
     negative_space: NegativeSpace | None = None
@@ -369,6 +371,7 @@ def apply_custom_effects(
     protected: set[str] | None = None,
     pairs: list[tuple[str, str]] | None = None,
     busy: dict[str, list[tuple[int, int]]] | None = None,
+    hands_off: set[str] | None = None,
 ) -> list[EffectPlacement]:
     """Place custom effects (then ``extra``, e.g. lyric cues), clipping generated effects
     out of their way.
@@ -400,9 +403,12 @@ def apply_custom_effects(
         lo, hi = int(start * 1000), int(end * 1000)
         taken = set(protected or set()) | {n for n, spans in (busy or {}).items()
                                            if any(a < hi and b > lo for a, b in spans)}
+        if isinstance(custom, SignatureMoment):  # the brief's moments and cues; the owner's
+            taken |= hands_off or set()           # own custom effects may use hands-off models
         names = [n for n in expand_models(custom.models, show_config) if n not in taken]
         others = getattr(custom, "others", None)
-        effects = clip_out(effects, names, None if others else custom.layer, lo, hi)
+        owns = bool(others) or getattr(custom, "exclusive", False)
+        effects = clip_out(effects, names, None if owns else custom.layer, lo, hi)
 
         if others:
             rest = [m.name for m in show_config.models if m.name not in names and m.name not in taken]

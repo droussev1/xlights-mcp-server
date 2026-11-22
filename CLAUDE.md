@@ -43,4 +43,6 @@ Related per-show and per-song state:
 - The xlights MCP server runs from this checkout; after code changes, reconnect it
   (`/mcp` → reconnect xlights) before calling its tools.
 - Never overwrite a sequence in the show folder without asking — the generator writes
-  `<song> (generated N).xsq` when the file exists.
+  `<song> (generated N).xsq` when the file exists, and moves that song's earlier
+  generated drafts (with their .fseq) into `<show>/archive/`. Never delete superseded
+  drafts; archive them.

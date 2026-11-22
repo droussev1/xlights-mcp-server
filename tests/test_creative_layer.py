@@ -161,3 +161,11 @@ def test_clicks_are_kept_ahead_of_other_hits_but_still_counted(tmp_path, monkeyp
     assert len(hits) <= 60 * 32 / 60 + 4 and len(clicks) >= 20  # clicks fill the budget first
     gaps = [b.start_time_ms - a.start_time_ms for a, b in zip(clicks, clicks[1:])]
     assert max(gaps) < 4000  # thinned evenly, not cut off
+
+
+def test_exclusive_moments_own_their_props_on_every_layer(tmp_path, monkeypatch):
+    base = {"name": "solo", "start": 4.0, "end": 8.0, "models": ["TREES"], "layer": 1, "effect": "Spirals_fast"}
+    for exclusive, others_show in [(False, True), (True, False)]:
+        plan = _run(tmp_path, monkeypatch, {"mood": "m", "signature_moment": {**base, "exclusive": exclusive}})
+        under = [e for e in _on(plan["spec"], "Tree L") if e.layer != 1 and e.start_time_ms < 8000 and e.end_time_ms > 4000]
+        assert bool(under) is others_show

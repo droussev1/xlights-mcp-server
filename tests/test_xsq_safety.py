@@ -245,3 +245,23 @@ def test_remap_removes_strobes_only_when_no_audio_matches(tmp_path, monkeypatch)
     assert analyzed == [] and strobes == []
     warnings = result["mapping_report"]["warnings"]
     assert any("searched" in w for w in warnings) and any("no audio" in w for w in warnings)
+
+
+def test_remapped_sequences_give_the_sign_one_steady_effect(tmp_path, monkeypatch):
+    import json
+    meta = tmp_path / "xLights.app/Contents/Resources/effectmetadata"
+    meta.mkdir(parents=True)
+    (meta / "Fire.json").write_text(json.dumps({"effectName": "Fire", "properties": [
+        {"id": "Fire_Height", "type": "int", "controlType": "slider", "min": 1, "max": 100}]}))
+    monkeypatch.setenv("XLIGHTS_APP", str(tmp_path / "xLights.app"))
+    rules = ShowRules.model_validate({"safety": {"sign": {
+        "model": "Sign", "colors": ["#FF0000"], "looks": {"embers": {"effect": "Fire", "settings": {"Fire_Height": 40}}}}}})
+    show = SHOW.model_copy(update={"show_path": str(tmp_path)})
+    root = _tree()
+    warnings = apply_safety(root, rules, show)
+    [sign] = root.findall("ElementEffects/Element[@name='Sign']/EffectLayer/Effect")
+    assert (sign.get("name"), sign.get("startTime"), sign.get("endTime")) == ("Fire", "0", "32000")
+    assert "E_SLIDER_Fire_Height=40" in root.findall("EffectDB/Effect")[int(sign.get("ref"))].text
+    assert "#FF0000" in root.findall("ColorPalettes/ColorPalette")[int(sign.get("palette"))].text
+    assert root.find("ElementEffects/Element[@name='ALL']") is None  # groups containing the sign lose effects
+    assert any("replaced 1 imported effect" in w for w in warnings)
