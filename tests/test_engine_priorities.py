@@ -108,6 +108,47 @@ def test_accent_density_by_tier_and_priority(tmp_path, monkeypatch):
     assert starts("Mega Tree", 24, 32) == starts("Eaves", 24, 32) == beats(24, 32)
 
 
+def test_mixed_priority_group_is_split(tmp_path, monkeypatch):
+    # An optional model grouped with a normal one must still go dark outside peaks
+    hat = LightModel(name="Hat", display_as="Matrix", pixel_count=168)
+    outline = LightModel(name="Hat Outline", display_as="Custom", pixel_count=156)
+    analysis = SongAnalysis(
+        file_path="song.mp3", file_name="song.mp3", duration_seconds=32.0,
+        beats=BeatMap(tempo=120.0, beat_times=BEATS, downbeat_times=DOWNBEATS), sections=SECTIONS,
+    )
+    show = ShowConfig(show_path=str(tmp_path), show_name="t", models=[hat, outline],
+                      model_groups=[ModelGroup(name="HATS", members=["Hat", "Hat Outline"])])
+    captured = {}
+    monkeypatch.setattr(engine, "write_xsq", lambda spec, *_: captured.setdefault("spec", spec))
+    engine._generate_auto(analysis, show, Path(tmp_path) / "song.mp3", None, "christmas",
+                          model_priorities={"Hat": "optional"})
+    effects = captured["spec"].effects
+    assert all(e.start_time_ms >= 24000 for e in _on(effects, "Hat"))
+    assert any(e.start_time_ms < 24000 for e in _on(effects, "Hat Outline"))
+
+
+def test_accents_never_overlap_on_uneven_beats(tmp_path, monkeypatch):
+    # Beats drift closer together than the nominal beat length
+    beats = [round(i * 0.45, 3) for i in range(70)]
+    analysis = SongAnalysis(
+        file_path="song.mp3", file_name="song.mp3", duration_seconds=31.5,
+        beats=BeatMap(tempo=120.0, beat_times=beats, downbeat_times=beats[::4]),
+        sections=[SongSection(label="chorus", start_time=0.0, end_time=31.5, energy_level=0.9)],
+    )
+    show = ShowConfig(show_path=str(tmp_path), show_name="t", models=[EAVES])
+    captured = {}
+    monkeypatch.setattr(engine, "write_xsq", lambda spec, *_: captured.setdefault("spec", spec))
+    engine._generate_auto(analysis, show, Path(tmp_path) / "song.mp3", None, "christmas")
+    hits = sorted((e.start_time_ms, e.end_time_ms) for e in _on(captured["spec"].effects, "Eaves", layer=2))
+    assert len(hits) == len(beats)
+    assert all(a[1] <= b[0] for a, b in zip(hits, hits[1:]))
+
+
+def test_snap_to_onsets():
+    assert engine._snap_to_onsets([1.0, 2.0, 3.0], [1.04, 2.5, 2.97]) == [1.04, 2.0, 2.97]
+    assert engine._snap_to_onsets([1.0], []) == [1.0]
+
+
 def test_rank_section_energy():
     secs = [SongSection(label="intro", start_time=0, end_time=1, energy_level=0.99)] + SECTIONS
     assert engine._rank_section_energy(secs) == ["breather", "breather", "normal", "normal", "peak"]

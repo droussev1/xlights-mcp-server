@@ -312,6 +312,49 @@ When generating, you'll be asked to choose a mode:
 - **guided** — see the song structure first, then choose effects per section
 - **template** — apply saved effect recipes to detected sections
 
+#### Model priorities
+
+Mark the props that matter most with `set_model_priority` (saved per show; a group's
+priority applies to its members):
+
+- **hero** — the stars: motion in every section but the intro/outro, faster effect changes,
+  accents on every other beat
+- **key** — keeps moving through quiet sections
+- **optional** — only lights up in the song's peaks
+
+Section energy is ranked within each song: the loudest ~20% of sections are *peaks*
+(accents on every beat for everyone), the quietest ~25% plus intro/outro are *breathers*
+(no accents), and other props accent once per bar.
+
+#### Per-song settings
+
+To hand-tune one song, put a JSON file next to the music file with the same name plus
+`.sequence.json` — e.g. `Holly Jolly Christmas.mp3` → `Holly Jolly Christmas.sequence.json`.
+`create_sequence` and `preview_plan` pick it up automatically. Every field is optional:
+
+```json
+{
+  "bar_anchor": 32.5,
+  "unmarked_tier": "normal",
+  "sections": [
+    {"name": "climax", "start": 65.5, "end": 72.4, "tier": "peak"},
+    {"name": "finale", "start": 100.6, "end": 113.2, "tier": "peak"}
+  ],
+  "effects": [
+    {"section": "finale", "models": ["PORCH-COLUMNS"], "layer": 2,
+     "effect": "Strobe_flash", "every_beats": 2, "length_beats": 1},
+    {"start": 32.0, "end": 65.5, "models": ["Matrix"], "layer": 0, "effect": "Butterfly_gentle"}
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `bar_anchor` | Seconds; a bar starts on the beat nearest this time (fixes a misdetected bar grid) |
+| `sections` | Named marks with `start`, `end`, `tier` (`peak` / `normal` / `breather`) and optional `label` (e.g. `bridge`). Sections are split at marks; marks within 0.25 s of a detected boundary snap to it |
+| `unmarked_tier` | Tier for sections no mark covers. Omit it to rank them by energy as usual |
+| `effects` | Custom effects on `models` (model or group names) for a named `section` or a `start`/`end` range, on `layer` 0–2. `effect` is an engine preset (`Strobe_flash`, `Butterfly_gentle`, `Spirals_fast`, …) or any xLights effect name; `settings` override preset values. `every_beats` repeats it on every Nth beat from the bar line (`length_beats` long); omit both for one effect across the range. Generated effects on the same models and layer are cleared from that range |
+
 ### Import a community sequence
 
 ```
@@ -363,7 +406,8 @@ The importer supports both standalone `.xsq` files and `.zip` packages (which in
 | Tool | Description |
 |------|-------------|
 | `create_sequence` | Generate a `.xsq` file from an `.mp3` with effects on all models |
-| `preview_plan` | Preview the generation plan without writing a file |
+| `preview_plan` | Preview the generation plan (sections and their tiers) without writing a file |
+| `set_model_priority` | Mark models or groups as hero / key / normal / optional for generated sequences |
 
 ### Sequence Import & Remapping
 | Tool | Description |

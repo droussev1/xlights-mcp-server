@@ -18,6 +18,7 @@ Palettes cycle per phrase (every 2-4 bars) for variety, not just per section.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import random
 from pathlib import Path
@@ -25,6 +26,8 @@ from pathlib import Path
 from xlights_mcp.audio.analyzer import SongAnalysis, StemAnalysis, full_analysis
 from xlights_mcp.audio.structure import SongSection
 from xlights_mcp.config import AudioConfig
+from xlights_mcp.sequencer import song_settings as song_settings_mod
+from xlights_mcp.sequencer.song_settings import SongSettings
 from xlights_mcp.xlights.models import LightModel, ShowConfig
 from xlights_mcp.xlights.palettes import ColorPalette, get_theme_palettes
 from xlights_mcp.xlights.show import load_show_config
@@ -190,6 +193,11 @@ EFFECT_VARIANTS: dict[str, list[dict[str, str]]] = {
         {"E_SLIDER_Marquee_Band_Size": "3", "E_SLIDER_Marquee_Skip_Size": "3",
          "E_SLIDER_Marquee_Speed": "3", "E_SLIDER_Marquee_Stagger": "0"},
     ],
+    "Strobe_flash": [
+        # Dense full-prop strobe; place it on beats for a rhythmic flash
+        {"E_SLIDER_Number_Strobes": "50", "E_SLIDER_Strobe_Duration": "3",
+         "E_SLIDER_Strobe_Type": "1", "E_CHECKBOX_Strobe_Music": "0"},
+    ],
     "On_solid": [{}],
 }
 
@@ -238,8 +246,13 @@ BREATHER_FRACTION = 0.25  # quietest sections → "breather"
 _UNRANKED_LABELS = ("intro", "outro", "transition")  # always "breather"
 
 
-def _rank_section_energy(sections: list[SongSection]) -> list[str]:
-    """Tier each section as "peak", "normal" or "breather" relative to the rest of the song."""
+def _rank_section_energy(
+    sections: list[SongSection], forced: list[str | None] | None = None,
+) -> list[str]:
+    """Tier each section as "peak", "normal" or "breather" relative to the rest of the song.
+
+    ``forced`` (from a song settings file) fixes the tier of any section where it isn't None.
+    """
     ranked = sorted(
         (i for i, s in enumerate(sections) if s.label not in _UNRANKED_LABELS),
         key=lambda i: sections[i].energy_level,
@@ -253,6 +266,8 @@ def _rank_section_energy(sections: list[SongSection]) -> list[str]:
             tiers[i] = "peak"
         elif rank < len(ranked) - n_breather:
             tiers[i] = "normal"
+    if forced:
+        tiers = [f or t for f, t in zip(forced, tiers)]
     return tiers
 
 
@@ -304,7 +319,7 @@ STEM_MOTION_OVERRIDES: dict[str, dict[str, list[str]]] = {
 STEM_ACCENT_OVERRIDES: dict[str, list[str]] = {
     "drums": ["Shockwave_hit", "Morph_quick"],
     "bass": ["Morph_quick"],
-    "vocals": [],  # suppress accents during vocal sections
+    "vocals": [],  # no stem preference — fall back to the model category's accents
     "other": ["Shockwave_hit"],
 }
 
@@ -415,7 +430,6 @@ def _detect_model_groups(
 
 
 PRIORITIES = ("hero", "key", "normal", "optional")
-_PRIORITY_RANK = {p: i for i, p in enumerate(PRIORITIES)}
 
 
 def _resolve_model_priorities(
@@ -464,14 +478,25 @@ def generate_sequence(
     if not show_config.models:
         return {"error": "No models found in show configuration"}
 
+    try:
+        settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
+        if settings:
+            song_settings_mod.validate_models(settings, show_config)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     analysis = full_analysis(mp3_path, audio_config)
 
     if mode == "auto":
-        return _generate_auto(
+        result = _generate_auto(
             analysis, show_config, mp3_path, palette_hint, theme,
             vocal_assignments=vocal_assignments,
             model_priorities=model_priorities,
+            song_settings=settings,
         )
+        if settings_path and result.get("success"):
+            result["song_settings"] = str(settings_path)
+        return result
     elif mode == "guided":
         return _generate_guided_preview(analysis, show_config)
     elif mode == "template":
@@ -490,13 +515,23 @@ def preview_sequence_plan(
     if not show_path or not show_path.exists():
         return {"error": f"Show path not found: {show_path}"}
 
+    try:
+        settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     analysis = full_analysis(mp3_path, audio_config)
     show_config = load_show_config(show_path)
+    forced = None
+    if settings:
+        analysis, forced = song_settings_mod.apply_to_analysis(settings, analysis)
+    tiers = _rank_section_energy(analysis.sections, forced)
 
     sections_summary = []
-    for s in analysis.sections:
+    for s, tier in zip(analysis.sections, tiers):
         sections_summary.append({
             "label": s.label,
+            "tier": tier,
             "start": f"{s.start_time:.1f}s",
             "end": f"{s.end_time:.1f}s",
             "duration": f"{s.duration:.1f}s",
@@ -504,6 +539,7 @@ def preview_sequence_plan(
         })
 
     return {
+        "song_settings": str(settings_path) if settings_path else None,
         "song": mp3_path.stem,
         "duration": f"{analysis.duration_seconds:.1f}s",
         "tempo": f"{analysis.beats.tempo:.0f} BPM",
@@ -527,6 +563,7 @@ def _generate_auto(
     theme: str | None,
     vocal_assignments: dict[str, str] | None = None,
     model_priorities: dict[str, str] | None = None,
+    song_settings: SongSettings | None = None,
 ) -> dict:
     """Professional-quality automatic sequence generation.
 
@@ -545,7 +582,13 @@ def _generate_auto(
     section but the intro/outro and faster variation; "key" models keep motion through
     breathers; "optional" models only light up in peak sections. Prioritized models
     never run singing faces.
+
+    A song settings file can re-anchor bars, force section tiers and add custom effects.
     """
+    forced_tiers = None
+    if song_settings:
+        analysis, forced_tiers = song_settings_mod.apply_to_analysis(song_settings, analysis)
+
     rng = random.Random(hash(mp3_path.stem))  # deterministic per song
 
     # Build palette pool
@@ -560,7 +603,7 @@ def _generate_auto(
     # Pre-compute beats within each section
     section_beats = _precompute_section_beats(analysis)
     section_downbeats = _precompute_section_downbeats(analysis)
-    section_tiers = _rank_section_energy(analysis.sections)
+    section_tiers = _rank_section_energy(analysis.sections, forced_tiers)
 
     # Detect model groups (uses xLights-defined groups, falls back to prefix detection)
     groups, ungrouped, group_categories = _detect_model_groups(show_config.models, show_config)
@@ -589,6 +632,18 @@ def _generate_auto(
     if singing_models:
         logger.info(f"Singing models excluded from regular pipeline: {list(singing_models.keys())}")
 
+    # Members with different priorities can't share one effect plan — split them
+    for group_name in list(groups):
+        by_priority: dict[str, list[LightModel]] = {}
+        for m in groups[group_name]:
+            by_priority.setdefault(priority_of.get(m.name, "normal"), []).append(m)
+        if len(by_priority) > 1:
+            cat = group_categories.pop(group_name)
+            del groups[group_name]
+            for p, members in by_priority.items():
+                groups[f"{group_name} ({p})"] = members
+                group_categories[f"{group_name} ({p})"] = cat
+
     # Track last motion effect key to avoid consecutive repeats
     last_motion_key_per_group: dict[str, str] = {}
 
@@ -596,10 +651,7 @@ def _generate_auto(
     def generate_for_models(model_names: list[str], cat: str, group_seed: str):
         group_rng = random.Random(hash(group_seed + mp3_path.stem))
         stem_data: StemAnalysis = analysis.stem_analysis
-        # A group takes the highest priority among its members
-        priority = min(
-            (priority_of.get(n, "normal") for n in model_names), key=_PRIORITY_RANK.__getitem__
-        )
+        priority = priority_of.get(model_names[0], "normal")  # groups are split by priority
 
         for sec_idx, section in enumerate(analysis.sections):
             is_peak = section_tiers[sec_idx] == "peak"
@@ -705,13 +757,10 @@ def _generate_auto(
 
             # --- LAYER 2: Accent hits (stem-reactive timing) ---
             if use_accents:
-                # Choose accent effects based on dominant stem
-                stem_accent = STEM_ACCENT_OVERRIDES.get(dom_stem, ["Shockwave_hit"])
-                if not stem_accent:
-                    # Vocals dominant → skip accents to not compete with faces
-                    continue
+                # Choose accent effects based on dominant stem (vocal-led sections have no
+                # stem preference and use the category's accents)
+                accent_choices = STEM_ACCENT_OVERRIDES.get(dom_stem) or ACCENT_EFFECTS.get(cat, ACCENT_EFFECTS["other"])
 
-                accent_choices = stem_accent
                 accent_key = group_rng.choice(accent_choices)
                 accent_settings = _get_settings(accent_key)
 
@@ -725,30 +774,34 @@ def _generate_auto(
 
                 if beat_step == 4:
                     accent_times = downbeats_in_section
-                elif stem_data.available and "drums" in stem_data.stems:
-                    # Drums hit roughly twice per beat, so thin to every 2nd/4th onset
-                    accent_times = stem_data.get_onsets_in_range(
-                        "drums", section.start_time, section.end_time
-                    )[::2 * beat_step]
                 else:
                     beats_here = section_beats.get(sec_idx, [])
                     # Keep every-other-beat hits on beats 1 and 3 of the bar
                     if beat_step == 2 and downbeats_in_section and downbeats_in_section[0] in beats_here:
                         beats_here = beats_here[beats_here.index(downbeats_in_section[0]) % 2:]
                     accent_times = beats_here[::beat_step]
+                if stem_data.available and "drums" in stem_data.stems:
+                    accent_times = _snap_to_onsets(accent_times, stem_data.get_onsets_in_range(
+                        "drums", section.start_time - DRUM_SNAP_SECONDS, section.end_time
+                    ))
 
                 beat_dur_ms = int(60000 / max(analysis.beats.tempo, 60))
                 accent_dur = min(beat_dur_ms, 500)
+                accent_ms = [int(t * 1000) for t in accent_times]
 
-                for j, t in enumerate(accent_times):
-                    t_ms = int(t * 1000)
+                for j, t_ms in enumerate(accent_ms):
+                    # Never run into the next hit or past the section
+                    next_ms = accent_ms[j + 1] if j + 1 < len(accent_ms) else section.end_time_ms
+                    end_ms = min(t_ms + accent_dur, next_ms)
+                    if end_ms <= t_ms:
+                        continue
                     accent_pal_idx = (pal_idx + j) % len(palette_pool)
                     for name in model_names:
                         all_effects.append(EffectPlacement(
                             model_name=name, layer=2,
                             effect_name=_effect_name_from_key(accent_key),
                             start_time_ms=t_ms,
-                            end_time_ms=t_ms + accent_dur,
+                            end_time_ms=end_ms,
                             settings=accent_settings,
                             palette=palette_pool[accent_pal_idx],
                         ))
@@ -783,12 +836,16 @@ def _generate_auto(
                 continue
 
             labels = []
-            for t in stem.onset_times:
-                t_ms = int(t * 1000)
+            onset_ms = [int(t * 1000) for t in stem.onset_times]
+            for j, t_ms in enumerate(onset_ms):
+                # Clip to the next onset so marks never overlap
+                end_ms = min(t_ms + onset_label_dur, onset_ms[j + 1]) if j + 1 < len(onset_ms) else t_ms + onset_label_dur
+                if end_ms <= t_ms:
+                    continue
                 labels.append(TimingTrackLabel(
                     label="x",
                     start_time_ms=t_ms,
-                    end_time_ms=t_ms + onset_label_dur,
+                    end_time_ms=end_ms,
                 ))
 
             timing_tracks.append(TimingTrack(
@@ -935,6 +992,11 @@ def _generate_auto(
                 generate_for_models([model_name], "custom", model_name)
             logger.info("Lyrics unavailable — singing models treated as regular custom models")
 
+    if song_settings and song_settings.effects:
+        all_effects = song_settings_mod.apply_custom_effects(
+            song_settings, all_effects, analysis, show_config, palette_pool,
+        )
+
     # Build sequence spec
     spec = SequenceSpec(
         song_title=mp3_path.stem, artist="", album="",
@@ -1055,6 +1117,21 @@ def _effect_name_from_key(variant_key: str) -> str:
         "On_solid": "On",
     }
     return key_to_effect.get(variant_key, variant_key.split("_")[0])
+
+
+DRUM_SNAP_SECONDS = 0.06
+
+
+def _snap_to_onsets(times: list[float], onsets: list[float]) -> list[float]:
+    """Move each time onto the nearest drum onset within DRUM_SNAP_SECONDS."""
+    if not onsets:
+        return times
+    snapped = []
+    for t in times:
+        i = bisect.bisect_left(onsets, t)
+        near = min(onsets[max(i - 1, 0):i + 1], key=lambda o: abs(o - t))
+        snapped.append(near if abs(near - t) <= DRUM_SNAP_SECONDS else t)
+    return snapped
 
 
 def _precompute_section_beats(analysis: SongAnalysis) -> dict[int, list[float]]:
