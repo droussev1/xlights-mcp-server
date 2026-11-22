@@ -38,6 +38,7 @@ class LightModel(BaseModel):
     submodels: list[SubModel] = Field(default_factory=list)
     face_definitions: list[str] = Field(default_factory=list)  # e.g. ["Standing Snowman Singing Face"]
     x: float | None = None  # layout position (WorldPosX): smaller is further to the audience's left
+    face_images: dict[str, list[str]] = Field(default_factory=dict)  # face definition → its image files
 
     @property
     def model_category(self) -> str:

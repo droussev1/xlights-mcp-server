@@ -135,11 +135,14 @@ def load_show_models(show_path: Path) -> list[LightModel]:
             # Collect submodels (child elements)
             submodels = []
             face_definitions = []
+            face_images: dict[str, list[str]] = {}
             for child in m:
                 if child.tag == "faceInfo":
                     face_name = child.get("Name", "")
                     if face_name:
                         face_definitions.append(face_name)
+                        face_images[face_name] = [v for v in child.attrib.values()
+                                                  if v.lower().endswith(IMAGE_SUFFIXES)]
                     continue
                 if child.tag in ("subModel", "strandNames", "nodeNames"):
                     continue
@@ -157,12 +160,26 @@ def load_show_models(show_path: Path) -> list[LightModel]:
                 string_type=m.get("StringType", "RGB Nodes"),
                 submodels=submodels,
                 face_definitions=face_definitions,
+                face_images=face_images,
                 x=_float(m.get("WorldPosX")),
             )
             models.append(model)
 
     logger.info(f"Loaded {len(models)} models from {effects_file}")
     return models
+
+
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
+
+
+def missing_face_images(model: LightModel, face: str, show_path: Path) -> list[str]:
+    """Image files a face definition uses that don't exist (absolute, or relative to the show folder)."""
+    missing = []
+    for path in model.face_images.get(face, []):
+        p = Path(path)
+        if not (p.is_file() or (not p.is_absolute() and (show_path / p).is_file())):
+            missing.append(path)
+    return missing
 
 
 def _float(value: str | None) -> float | None:

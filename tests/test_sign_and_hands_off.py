@@ -79,3 +79,28 @@ def test_superseded_drafts_move_to_the_archive(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == [
         "Other (generated 1).xsq", "Song (generated 2).xsq", "Song.xsq"]
     assert (tmp_path / "archive" / "Song (generated 1).xsq").exists()
+
+
+def test_faces_with_missing_images_dont_sing_and_warn(tmp_path, monkeypatch):
+    from xlights_mcp.audio.lyrics import LyricTrack, LyricWord
+    import test_show_rules as tsr
+    (tmp_path / "Faces").mkdir()
+    (tmp_path / "Faces" / "here.png").write_text("x")
+    models = [m.model_copy(update={"face_images": {"Face": [str(tmp_path / "Faces/here.png"), "/gone/mouth-AI.png"]}})
+              if m.name == "Singer" else m for m in tsr.MODELS]
+    words = [LyricWord(word=f"w{i}", start_time=4.2 + i * 0.5, end_time=4.6 + i * 0.5) for i in range(7)]
+    track = LyricTrack(track_name="Vocals", source="vocals_stem", words=words, phonemes=[], available=True, confidence=0.9)
+    monkeypatch.setattr(engine, "_try_extract_vocal_tracks", lambda _: [track])
+    rules = {**tsr.RULES, "style": {**tsr.RULES["style"], "singing": {"singers": ["Singer"], "opt_in": True}}}
+    show = ShowConfig(show_path=str(tmp_path), show_name="t", models=models, model_groups=tsr.GROUPS)
+    analysis = tsr.SongAnalysis(file_path="s.mp3", file_name="s.mp3", duration_seconds=32.0, sections=tsr.SECTIONS,
+                                beats=tsr.BeatMap(tempo=120.0, beat_times=tsr.BEATS, downbeat_times=tsr.DOWNBEATS))
+    def plan(faces):
+        return engine._generate_auto(analysis, show, tmp_path / "song.mp3", None, "christmas",
+                                     model_priorities={"TREES": "hero"},
+                                     song_settings=SongSettings.model_validate({**tsr.SETTINGS, "brief": {"mood": "m", "faces": faces}}),
+                                     show_rules=ShowRules.model_validate(rules), write=False)
+    with_faces = plan(True)
+    assert not [e for e in with_faces["spec"].effects if e.effect_name == "Faces"]
+    assert any("/gone/mouth-AI.png" in w and "'Singer' won't sing" in w for w in with_faces["warnings"])
+    assert plan(False)["warnings"] == []  # no faces wanted, nothing to check

@@ -649,6 +649,7 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
                         if strobes else None),
             "signature_colors": plan["signatures"],
             "design": plan["design"],
+            "warnings": plan["warnings"],
             "sign": plan["sign"],
             "faces": plan["faces"],
             "style_fixes": plan["style_fixes"],
@@ -853,6 +854,18 @@ def _generate_core(
             m.name in singers if singers is not None else priority_of.get(m.name, "normal") == "normal"
         ):
             singing_models[m.name] = m.face_definitions[0]
+    # A face whose images are missing would show broken in xLights: that prop doesn't sing
+    warnings: list[str] = []
+    from xlights_mcp.xlights.show import missing_face_images
+    by_name = {m.name: m for m in show_config.models}
+    faces_wanted = not (singing_cfg and singing_cfg.opt_in and not (brief and brief.faces))
+    for name, face in list(singing_models.items()) if faces_wanted else []:
+        gone = missing_face_images(by_name[name], face, Path(show_config.show_path))
+        if gone:
+            shown = ", ".join(gone[:3]) + (f" and {len(gone) - 3} more" if len(gone) > 3 else "")
+            warnings.append(f"Face images missing for '{name}' (face '{face}'): {shown}. "
+                            f"'{name}' won't sing until they're restored.")
+            del singing_models[name]
     # Faces are a creative choice: with opt_in they sing only if the brief asks; otherwise
     # the singers are ordinary secondary props
     if singing_cfg and singing_cfg.opt_in and not (brief and brief.faces) and singing_models:
@@ -1397,6 +1410,7 @@ def _generate_core(
             "finale": finale, "final_hit": final_hit, "signatures": signatures, "share": share,
             "sign": {"model": show_rules.safety.sign.model, "look": sign_look}
                     if show_rules and show_rules.safety.sign else None,
+            "warnings": warnings,
             "design": _design_summary(brief, design, stem_of, song_settings, cue_effects), "style_fixes": {
                 **style_fixes, "hits_over_budget_dropped": hits_dropped, "clicks": clicks_placed},
             "faces": bool(singing_models),
@@ -1427,6 +1441,7 @@ def _generate_core(
 
     return {
         "success": True,
+        "warnings": warnings,
         "archived_drafts": archived,
         "output_path": str(output_path),
         "song": mp3_path.stem,
