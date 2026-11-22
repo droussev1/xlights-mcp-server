@@ -808,6 +808,34 @@ def arch_steps(pattern: str, n: int) -> list[list[int]]:
     raise ValueError(f"Unknown arch pattern '{pattern}' (choose from {', '.join(ARCH_PATTERNS)})")
 
 
+def place_arch_walks(
+    effects: list[EffectPlacement], rules: ShowRules, walks, pattern: str | None, preset,
+) -> list[EffectPlacement]:
+    """During each walk, the arches step once per note (in the song's arch pattern, from
+    the audience's left) instead of once per beat. Placed over everything else on the
+    arches' motion layer, so a moment's dimmed yard doesn't hide a walk."""
+    chase = rules.style.arch_chase
+    if not (chase and walks):
+        return effects
+    slots = [(a.model, a.count - 1 - i if a.reverse else i, a.count) for a in chase.arches for i in range(a.count)]
+    steps = arch_steps(pattern or "chase", len(slots))
+    arch_names = [a.model for a in chase.arches]
+    on_name, on_settings = preset("On_solid")
+    for walk in walks:
+        times = walk.times
+        gaps = sorted(b - a for a, b in zip(times, times[1:]))
+        hold = gaps[len(gaps) // 2]
+        lo, hi = int(times[0] * 1000), int((times[-1] + hold) * 1000)
+        effects = clip_out(effects, arch_names, 1, lo, hi)
+        for k, t in enumerate(times):
+            end = times[k + 1] if k + 1 < len(times) else t + hold
+            for model, first, last, count in _arch_spans([slots[i] for i in steps[k % len(steps)]]):
+                sub = f"{first * 100 / count:.2f}x0.00x{(last + 1) * 100 / count:.2f}x100.00"
+                effects.append(_effect(model, 1, on_name, int(t * 1000), int(end * 1000), {
+                    **on_settings, "B_CHOICE_BufferStyle": "Single Line", "B_CUSTOM_SubBuffer": sub}))
+    return effects
+
+
 def _arch_spans(lit: list[tuple[str, int, int]]) -> list[tuple[str, int, int, int]]:
     """Lit (model, arch, count) slots → one (model, first, last, count) run per model,
     since a model gets only one effect per layer at a time. Patterns light contiguous

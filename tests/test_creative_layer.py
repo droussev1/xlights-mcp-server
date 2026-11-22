@@ -169,3 +169,16 @@ def test_exclusive_moments_own_their_props_on_every_layer(tmp_path, monkeypatch)
         plan = _run(tmp_path, monkeypatch, {"mood": "m", "signature_moment": {**base, "exclusive": exclusive}})
         under = [e for e in _on(plan["spec"], "Tree L") if e.layer != 1 and e.start_time_ms < 8000 and e.end_time_ms > 4000]
         assert bool(under) is others_show
+
+
+def test_arches_step_on_a_walks_notes_instead_of_the_beat(tmp_path, monkeypatch):
+    walk = [5.03, 5.26, 5.45, 5.65, 5.84]
+    plan = _run(tmp_path, monkeypatch, {"mood": "m", "arch_pattern": "chase", "arch_walks": [{"name": "piano", "times": walk}]})
+    steps = sorted((e.start_time_ms, e.model_name, e.settings["B_CUSTOM_SubBuffer"]) for e in plan["spec"].effects
+                   if e.model_name in ("Arch L", "Arch R") and e.layer == 1 and 5000 <= e.start_time_ms < 6000)
+    assert [t for t, _, _ in steps] == [5030, 5260, 5450, 5650, 5840]  # one step per note, none on the beat
+    assert [(m, sub.split("x")[0]) for _, m, sub in steps[:4]] == [
+        ("Arch L", "0.00"), ("Arch L", "25.00"), ("Arch L", "50.00"), ("Arch L", "75.00")]  # from the audience's left
+    assert steps[-1][1] == "Arch R"
+    with pytest.raises(ValueError, match="times must increase"):
+        _run(tmp_path, monkeypatch, {"mood": "m", "arch_walks": [{"times": [5.2, 5.1]}]})

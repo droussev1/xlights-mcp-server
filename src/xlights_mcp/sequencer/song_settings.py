@@ -126,6 +126,23 @@ class LyricCue(BaseModel):
     note: str = ""
 
 
+class ArchWalk(BaseModel):
+    """A run of featured notes (e.g. a piano walk) the arches step on, one step per note,
+    instead of one per beat, for the length of the run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    times: list[float] = Field(min_length=2)  # each note's start (s)
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if any(b <= a for a, b in zip(self.times, self.times[1:])):
+            raise ValueError(f"arch walk '{self.name}': times must increase")
+        return self
+
+
 class NegativeSpace(BaseModel):
     """Keep the yard dark: props light only in peaks, in sections where ``fill_stem`` swells
     above ``fill_above`` × its usual level, in moments and cues, and as clicks."""
@@ -180,6 +197,7 @@ class DesignBrief(BaseModel):
     secondary_moments: list[SignatureMoment] = Field(default_factory=list)
     negative_space: NegativeSpace | None = None
     clicks: list[Clicks] = Field(default_factory=list)
+    arch_walks: list[ArchWalk] = Field(default_factory=list)  # the arches step on these notes
     differences: list[str] = Field(default_factory=list)  # what makes this song different
     motion: Motion = "punchy"  # flowing: longer motion phrases, sparser and softer accents
     effects: dict[str, list[str]] = Field(default_factory=dict)  # model category → motion presets

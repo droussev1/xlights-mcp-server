@@ -1360,6 +1360,11 @@ def _generate_core(
             pairs=[tuple(x) for x in show_rules.style.symmetry.pairs] if show_rules and show_rules.style.symmetry else None,
         )
 
+    if show_rules and brief and brief.arch_walks:  # featured notes the arches step on
+        all_effects = show_rules_mod.place_arch_walks(
+            all_effects, show_rules, brief.arch_walks, design.arch_pattern if design else None,
+            preset=lambda key: (_effect_name_from_key(key), _get_settings(key)))
+
     style_fixes = {"plain_washes_replaced": 0, "fast_flash_hits_thinned": 0}
     if show_rules:
         # Style: the show's avoided looks and its limit on fast flashing
