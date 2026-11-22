@@ -226,3 +226,19 @@ class TestGenerateRemappedSequence:
         )
 
         assert output_path.name == "Imported Filename (remapped 1).xsq"
+
+
+def test_higher_layers_are_written_first_so_xlights_draws_them_on_top(tmp_path):
+    import xml.etree.ElementTree as ET
+    from xlights_mcp.xlights.models import LightModel, ShowConfig
+    from xlights_mcp.xlights.xsq_writer import EffectPlacement, SequenceSpec, write_xsq
+    spec = SequenceSpec(song_title="s", artist="", album="", media_file="s.mp3", duration_ms=1000, timing_ms=25,
+                        palettes=[], timing_tracks=[], effects=[
+                            EffectPlacement(model_name="M", layer=layer, effect_name=name, start_time_ms=0,
+                                            end_time_ms=500, settings={})
+                            for layer, name in [(0, "Twinkle"), (1, "Spirals"), (2, "Shockwave")]])
+    show = ShowConfig(show_path=str(tmp_path), show_name="t", models=[LightModel(name="M", display_as="Custom")])
+    out = tmp_path / "s.xsq"
+    write_xsq(spec, show, out)
+    layers = ET.parse(out).getroot().findall(".//ElementEffects/Element[@name='M']/EffectLayer")
+    assert [l.find("Effect").get("name") for l in layers] == ["Shockwave", "Spirals", "Twinkle"]

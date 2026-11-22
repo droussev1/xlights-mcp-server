@@ -187,7 +187,9 @@ def write_xsq(
         if not layers:
             ET.SubElement(ee, "EffectLayer")
         else:
-            for layer_idx in sorted(layers.keys()):
+            # xLights draws the first layer listed on top, so write the highest layer
+            # first: accents (2) over motion (1) over the background bed (0)
+            for layer_idx in sorted(layers.keys(), reverse=True):
                 layer_elem = ET.SubElement(ee, "EffectLayer")
                 for eff in sorted(layers[layer_idx], key=lambda e: e.start_time_ms):
                     effect_elem = ET.SubElement(layer_elem, "Effect")
