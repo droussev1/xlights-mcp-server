@@ -34,11 +34,7 @@ def _accent_starts(tmp_path, monkeypatch, energy: float) -> list[float]:
     return sorted(e.start_time_ms / 1000 for e in captured["spec"].effects if e.layer == 2)
 
 
-def test_high_energy_accents_hit_every_beat(tmp_path, monkeypatch):
-    starts = _accent_starts(tmp_path, monkeypatch, energy=0.9)
-    assert starts == BEATS
-
-
-def test_accents_hit_every_other_beat(tmp_path, monkeypatch):
-    starts = _accent_starts(tmp_path, monkeypatch, energy=0.7)
-    assert starts == BEATS[::2]
+def test_peak_accents_hit_every_beat(tmp_path, monkeypatch):
+    # A song's only ranked section is its peak, whatever its absolute energy
+    for energy in (0.9, 0.4):
+        assert _accent_starts(tmp_path, monkeypatch, energy=energy) == BEATS

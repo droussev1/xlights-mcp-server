@@ -276,9 +276,11 @@ def test_analysis_drives_parseable_non_overwriting_sequence(tmp_path, monkeypatc
     motion = [effect for effect in specs[0].effects if effect.layer == 1]
     assert motion
     section_bars = engine._precompute_section_downbeats(analysis)
+    tiers = engine._rank_section_energy(analysis.sections)
     expected_motion_spans = {
         (int(start * 1000), int(end * 1000))
         for i, section in enumerate(analysis.sections)
+        if tiers[i] != "breather"  # breathers hold the bed only
         for start, end in (
             pairwise(section_bars[i])
             if len(section_bars[i]) >= 2

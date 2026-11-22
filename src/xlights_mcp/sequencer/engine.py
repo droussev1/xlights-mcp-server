@@ -231,9 +231,29 @@ ACCENT_EFFECTS: dict[str, list[str]] = {
     "other": ["Shockwave_hit"],
 }
 
-# Section energy thresholds
-HIGH_ENERGY_THRESHOLD = 0.65
-LOW_ENERGY_THRESHOLD = 0.35
+# Section energy is ranked within each song rather than against fixed thresholds,
+# since mastering levels vary so much that a whole song can sit above any cutoff
+PEAK_FRACTION = 0.2       # loudest sections → "peak"
+BREATHER_FRACTION = 0.25  # quietest sections → "breather"
+_UNRANKED_LABELS = ("intro", "outro", "transition")  # always "breather"
+
+
+def _rank_section_energy(sections: list[SongSection]) -> list[str]:
+    """Tier each section as "peak", "normal" or "breather" relative to the rest of the song."""
+    ranked = sorted(
+        (i for i, s in enumerate(sections) if s.label not in _UNRANKED_LABELS),
+        key=lambda i: sections[i].energy_level,
+        reverse=True,
+    )
+    n_peak = max(1, round(len(ranked) * PEAK_FRACTION)) if ranked else 0
+    n_breather = round(len(ranked) * BREATHER_FRACTION)
+    tiers = ["breather"] * len(sections)
+    for rank, i in enumerate(ranked):
+        if rank < n_peak:
+            tiers[i] = "peak"
+        elif rank < len(ranked) - n_breather:
+            tiers[i] = "normal"
+    return tiers
 
 
 # ---------------------------------------------------------------------------
@@ -517,10 +537,14 @@ def _generate_auto(
 
     Grouped models (canes, arches, etc.) get identical effects for synchronization.
 
+    Sections are tiered by energy relative to the rest of the song (peak / normal /
+    breather). Accents land on every beat in peaks; elsewhere hero models accent every
+    other beat and other models once per bar; breathers get no accents.
+
     Model priorities scale how busy a model is: "hero" models get motion in every
-    section but the intro/outro, accents from medium energy up and faster variation;
-    "key" models keep motion through low-energy sections; "optional" models only
-    light up in high-energy sections. Prioritized models never run singing faces.
+    section but the intro/outro and faster variation; "key" models keep motion through
+    breathers; "optional" models only light up in peak sections. Prioritized models
+    never run singing faces.
     """
     rng = random.Random(hash(mp3_path.stem))  # deterministic per song
 
@@ -536,6 +560,7 @@ def _generate_auto(
     # Pre-compute beats within each section
     section_beats = _precompute_section_beats(analysis)
     section_downbeats = _precompute_section_downbeats(analysis)
+    section_tiers = _rank_section_energy(analysis.sections)
 
     # Detect model groups (uses xLights-defined groups, falls back to prefix detection)
     groups, ungrouped, group_categories = _detect_model_groups(show_config.models, show_config)
@@ -577,9 +602,9 @@ def _generate_auto(
         )
 
         for sec_idx, section in enumerate(analysis.sections):
-            is_high = section.energy_level >= HIGH_ENERGY_THRESHOLD
-            is_low = section.energy_level < LOW_ENERGY_THRESHOLD
-            if priority == "optional" and not is_high:
+            is_peak = section_tiers[sec_idx] == "peak"
+            is_breather = section_tiers[sec_idx] == "breather"
+            if priority == "optional" and not is_peak:
                 continue
 
             pal_idx = (sec_idx // 2 + hash(group_seed)) % len(palette_pool)
@@ -589,11 +614,10 @@ def _generate_auto(
 
             # Determine section type config
             sec_config = SECTION_TYPE_CONFIG.get(section.label, SECTION_TYPE_CONFIG["unknown"])
-            use_motion = sec_config.get("use_motion", True) and not is_low
-            use_accents = sec_config.get("use_accents", False) and is_high
+            use_motion = sec_config.get("use_motion", True) and not is_breather
+            use_accents = is_peak or (sec_config.get("use_accents", False) and not is_breather)
             if priority == "hero":
                 use_motion = section.label not in ("intro", "outro")
-                use_accents = use_motion and (is_high or (sec_config.get("use_accents", False) and not is_low))
             elif priority == "key":
                 use_motion = sec_config.get("use_motion", True)
 
@@ -606,7 +630,7 @@ def _generate_auto(
             bed_override = sec_config.get("bed_override")
             if bed_override:
                 bed_key = bed_override
-            elif is_high:
+            elif is_peak:
                 bed_choices = BED_EFFECTS.get(cat, BED_EFFECTS["other"])
                 bed_key = "Twinkle_dense" if "Twinkle_ambient" in bed_choices else bed_choices[0]
             else:
@@ -643,7 +667,7 @@ def _generate_auto(
 
                 if len(downbeats_in_section) >= 2:
                     # Vary effect every 2-4 bars within the section
-                    bars_per_variant = 2 if is_high else 4
+                    bars_per_variant = 2 if is_peak else 4
                     if priority == "hero":
                         bars_per_variant //= 2
                     variant_idx = 0
@@ -691,19 +715,27 @@ def _generate_auto(
                 accent_key = group_rng.choice(accent_choices)
                 accent_settings = _get_settings(accent_key)
 
-                # Use drum onsets for timing when available, fall back to downbeats
-                if stem_data.available and "drums" in stem_data.stems:
+                # Every beat in peaks, every other beat for heroes, once per bar otherwise
+                if is_peak:
+                    beat_step = 1
+                elif priority == "hero":
+                    beat_step = 2
+                else:
+                    beat_step = 4
+
+                if beat_step == 4:
+                    accent_times = downbeats_in_section
+                elif stem_data.available and "drums" in stem_data.stems:
+                    # Drums hit roughly twice per beat, so thin to every 2nd/4th onset
                     accent_times = stem_data.get_onsets_in_range(
                         "drums", section.start_time, section.end_time
-                    )
-                    # Thin out to every 2nd or 4th hit to avoid over-accenting
-                    accent_interval = 2 if section.energy_level > 0.85 else 4
-                    accent_times = accent_times[::accent_interval]
+                    )[::2 * beat_step]
                 else:
-                    # No drum stems: hit the beat grid at roughly the density the
-                    # drum path aims for (every 2nd/4th drum hit ≈ every 1st/2nd beat)
-                    accent_interval = 1 if section.energy_level > 0.85 else 2
-                    accent_times = section_beats.get(sec_idx, [])[::accent_interval]
+                    beats_here = section_beats.get(sec_idx, [])
+                    # Keep every-other-beat hits on beats 1 and 3 of the bar
+                    if beat_step == 2 and downbeats_in_section and downbeats_in_section[0] in beats_here:
+                        beats_here = beats_here[beats_here.index(downbeats_in_section[0]) % 2:]
+                    accent_times = beats_here[::beat_step]
 
                 beat_dur_ms = int(60000 / max(analysis.beats.tempo, 60))
                 accent_dur = min(beat_dur_ms, 500)
@@ -853,14 +885,12 @@ def _generate_auto(
 
                 # Layer 0: Section-aware background that illuminates the whole model
                 for sec_idx, section in enumerate(analysis.sections):
-                    is_high = section.energy_level >= HIGH_ENERGY_THRESHOLD
-                    is_low = section.energy_level < LOW_ENERGY_THRESHOLD
                     pal_idx = sec_idx % len(palette_pool)
                     palette = palette_pool[pal_idx]
 
-                    if is_high:
+                    if section_tiers[sec_idx] == "peak":
                         bed_key = "Twinkle_dense"
-                    elif is_low:
+                    elif section_tiers[sec_idx] == "breather":
                         bed_key = "ColorWash_slow"
                     else:
                         bed_key = singing_rng.choice(["Twinkle_ambient", "ColorWash_cycling", "Butterfly_gentle"])

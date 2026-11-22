@@ -23,10 +23,12 @@ GROUPS = [
     ModelGroup(name="MEGA-TREES", members=["Mega Tree", "Mega Tree-2"]),
 ]
 
-# 0–16 s quiet verse, 16–32 s loud chorus
+# Four 8 s choruses ranked breather (0–8), normal (8–16, 16–24), peak (24–32)
 SECTIONS = [
-    SongSection(label="verse", start_time=0.0, end_time=16.0, energy_level=0.2),
-    SongSection(label="chorus", start_time=16.0, end_time=32.0, energy_level=0.9),
+    SongSection(label="chorus", start_time=0.0, end_time=8.0, energy_level=0.3),
+    SongSection(label="chorus", start_time=8.0, end_time=16.0, energy_level=0.6),
+    SongSection(label="chorus", start_time=16.0, end_time=24.0, energy_level=0.7),
+    SongSection(label="chorus", start_time=24.0, end_time=32.0, energy_level=0.9),
 ]
 
 
@@ -64,10 +66,10 @@ def test_umbrella_group_does_not_stack_effects(tmp_path, monkeypatch):
     assert len(_on(effects, "Eaves", layer=0)) == len(SECTIONS)
 
 
-def test_hero_moves_in_quiet_sections_and_skips_faces(tmp_path, monkeypatch):
+def test_hero_moves_in_breathers_and_skips_faces(tmp_path, monkeypatch):
     effects = _effects(tmp_path, monkeypatch, {"MEGA-TREES": "hero"})
     for tree in ("Mega Tree", "Mega Tree-2"):
-        assert any(e.end_time_ms <= 16000 for e in _on(effects, tree, layer=1))
+        assert any(e.end_time_ms <= 8000 for e in _on(effects, tree, layer=1))
         assert not [e for e in _on(effects, tree) if e.effect_name == "Faces"]
     # Both trees stay in sync as a group
     assert [e.start_time_ms for e in _on(effects, "Mega Tree")] == [
@@ -75,18 +77,40 @@ def test_hero_moves_in_quiet_sections_and_skips_faces(tmp_path, monkeypatch):
     ]
 
 
-def test_key_moves_in_quiet_sections(tmp_path, monkeypatch):
+def test_key_moves_in_breathers(tmp_path, monkeypatch):
     normal = _effects(tmp_path, monkeypatch)
-    assert not any(e.end_time_ms <= 16000 for e in _on(normal, "Eaves", layer=1))
+    assert not any(e.end_time_ms <= 8000 for e in _on(normal, "Eaves", layer=1))
     key = _effects(tmp_path, monkeypatch, {"Eaves": "key"})
-    assert any(e.end_time_ms <= 16000 for e in _on(key, "Eaves", layer=1))
+    assert any(e.end_time_ms <= 8000 for e in _on(key, "Eaves", layer=1))
 
 
-def test_optional_only_in_high_energy(tmp_path, monkeypatch):
+def test_optional_only_in_peaks(tmp_path, monkeypatch):
     effects = _effects(tmp_path, monkeypatch, {"Matrix": "optional"})
     matrix = _on(effects, "Matrix")
     assert matrix
-    assert all(e.start_time_ms >= 16000 for e in matrix)
+    assert all(e.start_time_ms >= 24000 for e in matrix)
+
+
+def test_accent_density_by_tier_and_priority(tmp_path, monkeypatch):
+    effects = _effects(tmp_path, monkeypatch, {"MEGA-TREES": "hero"})
+
+    def starts(model, lo, hi):
+        return sorted(e.start_time_ms / 1000 for e in _on(effects, model, layer=2) if lo * 1000 <= e.start_time_ms < hi * 1000)
+
+    beats = lambda lo, hi: [b for b in BEATS if lo <= b < hi]  # noqa: E731
+    bars = lambda lo, hi: [b for b in DOWNBEATS if lo <= b < hi]  # noqa: E731
+    # Breather: no accents for anyone
+    assert starts("Mega Tree", 0, 8) == starts("Eaves", 0, 8) == []
+    # Normal: heroes every other beat, others once per bar
+    assert starts("Mega Tree", 8, 24) == beats(8, 16)[::2] + beats(16, 24)[::2]
+    assert starts("Eaves", 8, 24) == bars(8, 24)
+    # Peak: every beat for everyone
+    assert starts("Mega Tree", 24, 32) == starts("Eaves", 24, 32) == beats(24, 32)
+
+
+def test_rank_section_energy():
+    secs = [SongSection(label="intro", start_time=0, end_time=1, energy_level=0.99)] + SECTIONS
+    assert engine._rank_section_energy(secs) == ["breather", "breather", "normal", "normal", "peak"]
 
 
 def test_model_priority_overrides_group():
