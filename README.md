@@ -79,7 +79,7 @@ and run `uv venv --python 3.12` again. PyTorch wheels for `separation` and
 # Stem separation — isolates vocals/drums/bass for smarter sequencing (~2GB model download)
 uv pip install -e ".[separation]"
 
-# Lyrics/singing faces — transcribes vocals for lip-sync animation
+# Lyrics/singing faces — transcribes vocals for lip-sync animation (Whisper medium, ~1.5GB model download)
 uv pip install -e ".[lyrics]"
 
 # Better beat detection
@@ -255,7 +255,7 @@ the same beat and spectrum models returned by `get_beat_map` and
 |--------|-------------------|------------------------|
 | Beats | `tempo_curve` | Overlapping 10-second windows, approximately 5 seconds apart; `time` is the window start in seconds, `tempo` is BPM, and `beat_count` records supporting detections. Short clips use one window; insufficient evidence yields zero BPM. |
 | Beats | `tempo_changes` | Adjacent positive window estimates differing by more than 10%; `time`, `from_tempo`, and `to_tempo`. These are diagnostic estimates, not exact change boundaries. |
-| Beats | `meter_confidence`, `downbeat_confidence`, `rhythm_method`, `warnings` | Heuristic evidence scores (not calibrated probabilities), selected backend, and degraded-analysis diagnostics. |
+| Beats | `meter_confidence`, `downbeat_confidence`, `rhythm_method`, `warnings` | Heuristic evidence scores (not calibrated probabilities; `"n/a"` when `rhythm_method` is `madmom`, whose model picks the grid without a comparable score), selected backend, and degraded-analysis diagnostics. |
 | Spectrum | `spectral_flux` | Positive frame-to-frame magnitude changes, normalized to 0-1. |
 | Spectrum | `spectral_centroid`, `spectral_bandwidth`, `spectral_rolloff` | Hz; rolloff marks 85% of cumulative spectral magnitude. |
 | Spectrum | `spectral_flatness` | Dimensionless 0-1 noise/tonality descriptor; silence is not evidence of audible noise. |
@@ -355,8 +355,21 @@ To hand-tune one song, put a JSON file next to the music file with the same name
 | `unmarked_tier` | Tier for sections no mark covers. Omit it to rank them by energy as usual |
 | `signature_colors` | One or two `#RRGGBB` accent colors for this song, overriding the show's pick |
 | `final_hit` | Seconds; overrides the detected final hit |
-| `singing` | Overrides for the show's `singing.moments` settings, e.g. `{"vocal_drum_ratio": 2.5, "max_share": 0.3}` |
+| `singing` | Overrides for the show's `singing.moments` settings, e.g. `{"exposed_fraction": 0.4, "max_share": 0.3}` |
 | `effects` | Custom effects on `models` (model or group names) for a named `section` or a `start`/`end` range, on `layer` 0–2. `effect` is an engine preset (`Strobe_flash`, `Butterfly_gentle`, `Spirals_fast`, …) or any xLights effect name; `settings` override preset values. `every_beats` repeats it on every Nth beat from the bar line (`length_beats` long); omit both for one effect across the range. Generated effects on the same models and layer are cleared from that range |
+
+#### Lyrics file
+
+Whisper often mishears sung lyrics. To fix the words, put the lyrics in a text file next
+to the music file with the same name plus `.lyrics.txt` — e.g. `Winter Wonderland.mp3` →
+`Winter Wonderland.lyrics.txt`. Blank lines, `#` comments and `[Chorus]`-style tags are
+ignored. The file's words are used in order, and Whisper only supplies the timing: each
+known word is matched to the transcription; a misheard run takes the misheard words' time
+span; words Whisper didn't hear fill the gap between their neighbours only when it's tight
+enough to sing (otherwise they're left out); words Whisper heard that aren't in the file are
+dropped. The track's confidence becomes the share of the file's words timed from Whisper's,
+and is checked against the rules' `min_confidence` as usual. Transcriptions are cached per
+music file, so editing the lyrics file doesn't re-run Whisper.
 
 #### Show rules
 
@@ -385,9 +398,9 @@ with an error. All fields are optional.
 | `arch_chase` | Arch models listed left to right with their arch `count` (and `reverse` if wired right to left); their motion becomes one arch per beat, starting on the bar line, in every non-breather section |
 | `floods` | One solid color per section, stepping through the palette's non-white colors — never motion or accents |
 | `twinkle` | Props that only twinkle in the given `tiers` (intro/outro count as breathers) |
-| `final_hit` | Props kept dark until the final hit, then held for `bars` and faded. The final hit is the per-song `final_hit`, else the beat nearest the end of the last peak, else (no peak) the strongest hit in the last 15 seconds |
-| `singing` | Which face models sing (`singers`). Each defaults to the vocal-stem track; if that transcription's mean word confidence is below `min_confidence` the song is treated as having no lyrics, and `without_lyrics` priorities apply. With `moments`, faces sing only in vocal feature moments: whole lyric phrases (split at silences over `phrase_gap_seconds`, at least `min_phrase_bars` long) where the vocal stem is at least `vocal_drum_ratio` × the drum stem and the drums are sparse (≤ `max_drum_onsets_per_beat`) or steady (inter-onset spread ≤ `max_drum_irregularity`), outside `avoid_tiers`, ending at least `peak_lead_bars` before any peak and (with `protect_builds`) before the build section leading into it — later phrases are trimmed off the moment and listed in the preview — loudest vocals first up to `max_share` of the song; phrases within `merge_gap_bars` sing as one moment. During a moment the other props keep their bed, lose accent hits and keep only `gentle_motion` (no chases), and floods hold their color; between moments singers use the `between_moments` priority. Without `moments`, singers sing the whole song |
-| `palettes` | `core` palettes chosen by `by_model` → `by_section_label` → `by_tier` → `default` (plus `arch_chase`); per-song signature colors drawn from `accent_pool` go on secondary props at peaks, on every other hero accent hit (always paired with a core color) and on one featured section, capped at `max_accent_share` of effect time. Each song gets a color set (a pair, with `signatures_per_song: 2`) that no other song in the show has — 28 pairs from 8 colors — remembered in `xlights_mcp_signatures.json`; `signature_colors` in a song's settings file overrides it but must also be unique |
+| `final_hit` | Props kept dark until the final hit, then held for `bars` and faded. The final hit is the per-song `final_hit`, else the last strong downbeat before the music goes silent — the downbeat grid is carried on to the end of the music, and a downbeat is strong when its attack and loudness are near the song's typical downbeat (a chord ringing into the fade isn't) — snapped to its onset; without downbeats, the strongest hit in the last 15 seconds of music. With `overrides_calm_bed` (default), a final hit inside a singing moment ends the calm bed there: the faces finish the phrase while every other prop (except floods) accents the hit and gets its regular effects back |
+| `singing` | Which face models sing (`singers`). Each defaults to the vocal-stem track; if that transcription's mean word confidence is below `min_confidence` the song is treated as having no lyrics, and `without_lyrics` priorities apply. With `moments`, faces sing only in vocal feature moments: whole lyric phrases (split at silences over `phrase_gap_seconds`, phrases over `max_phrase_bars` split again at their longest pauses, at least `min_phrase_bars` long) that are the song's most exposed — vocal stem ÷ drum stem is ranked within the song like section energy and the top `exposed_fraction` of eligible phrases qualify (at least one; never below `min_vocal_drum_ratio`) — and, with `cross_check` (default), never where the vocal-stem and full-mix transcriptions disagree (different words or word count, or the same word starting more than `max_cross_check_offset_seconds` apart: those words are dropped and break their phrase, and the preview lists them as `disputed_passages`) — where the drums are sparse (≤ `max_drum_onsets_per_beat`) or steady (inter-onset spread ≤ `max_drum_irregularity`), outside `avoid_tiers`, ending at least `peak_lead_bars` before any peak and (with `protect_builds`) before the build section leading into it — later phrases are trimmed off the moment and listed in the preview — most exposed first up to `max_share` of the song; phrases within `merge_gap_bars` sing as one moment. During a moment the other props keep their bed, lose accent hits and keep only `gentle_motion` (no chases), and floods hold their color; between moments singers use the `between_moments` priority. Without `moments`, singers sing the whole song |
+| `palettes` | `core` palettes chosen by `by_model` → `by_section_label` → `by_tier` → `default` (plus `arch_chase`); per-song signature colors drawn from `accent_pool` go on secondary props at peaks, on every other hero accent hit (always paired with a core color) and on one featured section, capped at `max_accent_share` of effect time. Each song gets a color set (a pair, with `signatures_per_song: 2`) that no other song in the show has — 28 pairs from 8 colors — remembered in `xlights_mcp_signatures.json`; single colors may recur in different sets, but with `adjacent_songs_distinct` songs next to each other in show order (by track-number prefix, e.g. `06 Holly Jolly Christmas`; songs without one have no neighbors) share no signature color. `signature_colors` in a song's settings file overrides the pick but must follow both rules |
 
 `preview_plan` runs exactly the generation `create_sequence` would (same settings, rules,
 lyrics and colors) without writing, and summarizes it per section and per rule. Both

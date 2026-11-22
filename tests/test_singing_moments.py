@@ -58,7 +58,7 @@ def _analysis():
     )
 
 
-MOMENTS = {"vocal_drum_ratio": 3.0, "max_share": 0.25}
+MOMENTS = {"max_share": 0.25}
 SINGING = {"singers": ["Singer", "Screen"], "without_lyrics": {"Singer": "optional", "Screen": "optional"},
            "moments": MOMENTS}
 RULES = {"safety": SAFETY, "style": {**STYLE, "priorities": {}, "singing": SINGING,
@@ -81,7 +81,7 @@ def _run(tmp_path, monkeypatch, rules=None, settings=None):
     return result, captured["spec"]
 
 
-def test_picks_whole_phrases_where_vocals_clearly_dominate():
+def test_picks_the_songs_most_exposed_whole_phrases():
     moments = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS,
                                               SingingMoments(**MOMENTS))
     assert [(m.start, round(m.end, 1)) for m in moments] == [(4.2, 7.6)]
@@ -126,18 +126,18 @@ def test_cap_keeps_only_the_loudest_vocal_phrases():
     analysis.stem_analysis.stems["drums"].energy = [0.1 if 4 <= t < 8 else 0.2 if 8 <= t < 12 else 1.0
                                                     for t in FRAMES]
     tiers = TIERS
-    both = show_rules.pick_singing_moments(words, analysis, tiers, SingingMoments(**MOMENTS))
+    both = show_rules.pick_singing_moments(words, analysis, tiers, SingingMoments(**MOMENTS, exposed_fraction=1))
     assert len(both) == 2
-    capped = show_rules.pick_singing_moments(words, analysis, tiers, SingingMoments(vocal_drum_ratio=3, max_share=0.1))
+    capped = show_rules.pick_singing_moments(words, analysis, tiers, SingingMoments(exposed_fraction=1, max_share=0.1))
     assert [m.start for m in capped] == [4.2]  # ratio 10 beats ratio 5
 
 
 def test_per_song_overrides(tmp_path, monkeypatch):
-    result, spec = _run(tmp_path, monkeypatch, settings={**SETTINGS, "singing": {"vocal_drum_ratio": 20}})
+    result, spec = _run(tmp_path, monkeypatch, settings={**SETTINGS, "singing": {"min_vocal_drum_ratio": 20}})
     assert result["singing_moments"]["moments"] == []
     assert not [e for e in spec.effects if e.effect_name == "Faces"]
     with pytest.raises(ValueError, match="Invalid singing settings"):
-        _run(tmp_path, monkeypatch, settings={**SETTINGS, "singing": {"vocal_drum_ratoi": 2}})
+        _run(tmp_path, monkeypatch, settings={**SETTINGS, "singing": {"exposed_fractoin": 0.5}})
 
 
 def test_preview_lists_singing_moments(tmp_path, monkeypatch):
@@ -166,7 +166,7 @@ def test_moments_end_a_bar_before_peaks_and_spare_the_build():
     # A: 4.2–7.6 and B: 8.4–11.3 sing (merged); C: 12.4–14.8 is in the build before the peak
     words = _words(4.2, 8.0) + _words(8.4, 11.6) + _words(12.4, 15.0)
     trimmed = []
-    moments = show_rules.pick_singing_moments(words, analysis, TIERS, SingingMoments(**{**MOMENTS, "max_share": 1}),
+    moments = show_rules.pick_singing_moments(words, analysis, TIERS, SingingMoments(**{**MOMENTS, "max_share": 1, "exposed_fraction": 1}),
                                               trimmed=trimmed)
     assert [(m.start, round(m.end, 1)) for m in moments] == [(4.2, 11.3)]
     assert [(t.start, "build" in t.reason) for t in trimmed] == [(12.4, True)]
@@ -182,3 +182,92 @@ def test_peak_lead_time_is_a_setting():
     assert not show_rules.pick_singing_moments(words, analysis, TIERS, SingingMoments(**cfg, peak_lead_bars=1),
                                                trimmed=trimmed)
     assert "before the peak at 16.0s" in trimmed[0].reason
+
+
+def _flat_drums(level):
+    analysis = _analysis()
+    analysis.stem_analysis.stems["drums"].energy = [level] * len(FRAMES)
+    return analysis
+
+
+def test_exposure_is_ranked_within_the_song():
+    # Vocals only twice the drums everywhere: a fixed 3× threshold would never sing
+    analysis = _flat_drums(0.5)
+    analysis.stem_analysis.stems["drums"].energy = [0.4 if 4 <= t < 8 else 0.5 for t in FRAMES]
+    words = _words(4.2, 7.0) + _words(9.0, 11.6)  # 2.5× and 2×
+    moments = show_rules.pick_singing_moments(words, analysis, TIERS, SingingMoments(**MOMENTS))
+    assert [m.start for m in moments] == [4.2]  # only the most exposed quarter (at least one)
+    # The floor still applies: drums louder than the vocals never sing
+    loud = _flat_drums(2.0)
+    assert not show_rules.pick_singing_moments(words, loud, TIERS, SingingMoments(**MOMENTS))
+
+
+def test_exposed_fraction_takes_the_top_share_of_phrases():
+    analysis = _flat_drums(0.5)
+    levels = {4: 0.1, 6: 0.2, 8: 0.3, 10: 0.4}  # four 2 s phrases, most exposed first
+    analysis.stem_analysis.stems["drums"].energy = [levels.get(int(t) // 2 * 2, 0.5) for t in FRAMES]
+    words = [w for a in (4.0, 6.0, 8.0, 10.0) for w in _words(a, a + 1.5)]  # a to a + 1.4 s
+    cfg = SingingMoments(max_share=1, exposed_fraction=0.5, phrase_gap_seconds=0.15, min_phrase_bars=0.5)
+    moments = show_rules.pick_singing_moments(words, analysis, TIERS, cfg)
+    assert [(m.start, round(m.end, 1)) for m in moments] == [(4.0, 7.4)]  # 4 and 6 qualify, sung as one
+
+
+def test_long_phrases_split_at_their_longest_pauses():
+    analysis = _flat_drums(0.1)
+    # One unbroken 4.2–11.7 s phrase (0.1 s gaps) with a 0.9 s pause at 7.3 s
+    words = [w for w in _words(4.2, 7.8, step=0.4)] + _words(8.2, 11.8, step=0.4)
+    for w in words:
+        w.end_time = w.start_time + 0.3
+    phrases = show_rules._split_phrase(words, max_seconds=4.0, min_seconds=2.0)
+    assert [(p[0].start_time, round(p[-1].end_time, 1)) for p in phrases] == [(4.2, 7.3), (8.2, 11.7)]
+    # Pieces are never shorter than min_seconds: a pause near one end is skipped
+    assert len(show_rules._split_phrase(words, max_seconds=4.0, min_seconds=4.0)) == 1
+    cfg = SingingMoments(max_share=0.12, exposed_fraction=1, max_phrase_bars=2)  # 4 s, 3.84 s budget
+    moments = show_rules.pick_singing_moments(words, analysis, TIERS, cfg)
+    [moment] = moments  # unsplit, the 7.5 s phrase was over the cap; now one piece fits
+    assert (moment.start, round(moment.end, 1)) in [(4.2, 7.3), (8.2, 11.7)]
+
+
+def test_final_hit_overrides_the_calm_bed(tmp_path, monkeypatch):
+    # The final hit (6 s) falls inside the 4.2–7.6 s moment
+    _, spec = _run(tmp_path, monkeypatch, settings={**SETTINGS, "final_hit": 6.0})
+    for singer in ("Singer", "Screen"):  # the faces finish the phrase
+        assert [(e.start_time_ms, e.end_time_ms) for e in _on(spec, singer) if e.effect_name == "Faces"] == [(4200, 7600)]
+    yard = {m.name for m in MODELS} - {"Singer", "Screen", "Flood", "Sign", "Big Star"}
+    hits = {e.model_name for e in spec.effects if e.layer == 2 and e.start_time_ms == 6000}
+    assert hits == yard  # the whole yard hits with the star
+    assert [e.start_time_ms for e in _on(spec, "Big Star")] == [6000]
+    gentle = [(engine._effect_name_from_key(k), engine._get_settings(k)) for k in SingingMoments().gentle_motion]
+    calm = [e for e in spec.effects if e.model_name in yard and e.end_time_ms > 4200 and e.start_time_ms < 6000]
+    assert not [e for e in calm if e.layer == 2]  # still calm before the hit
+    assert all((e.effect_name, e.settings) in gentle for e in calm if e.layer == 1)
+    # Without the override, the calm bed runs to the end of the moment
+    rules = {**RULES, "style": {**RULES["style"], "final_hit": {"models": ["Big Star"], "overrides_calm_bed": False}}}
+    _, spec = _run(tmp_path, monkeypatch, rules=rules, settings={**SETTINGS, "final_hit": 6.0})
+    assert not [e for e in spec.effects if e.layer == 2 and 4200 <= e.start_time_ms < 7600]
+
+
+def test_no_singing_where_the_transcriptions_disagree():
+    # The mix hears the 5.2 and 5.7 s words differently: a different-word passage
+    mix = [w.model_copy(update={"word": "uh"}) if 5.2 <= w.start_time < 6.1 else w for w in WORDS]
+    bad, _, passages = show_rules.cross_check(WORDS, mix, 0.35)
+    assert [(p.start, p.end, p.mix) for p in passages] == [(5.2, 6.1, "uh uh")]
+    # ...and hears the 6.7 s word half a second later: a timing disagreement
+    mix = [w.model_copy(update={"start_time": w.start_time + 0.5, "end_time": w.end_time + 0.5})
+           if 6.6 <= w.start_time < 6.8 else w for w in WORDS]
+    disputed = []
+    moments = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS, SingingMoments(**MOMENTS),
+                                              reference_words=mix, disputed=disputed)
+    assert [(d.start, d.end) for d in disputed] == [(6.7, 7.6)]
+    # 4.2–6.6 s still sings; after the disputed word only a fragment (7.2–7.6 s) is left
+    assert [(m.start, round(m.end, 1)) for m in moments] == [(4.2, 6.6)]
+    off = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS, SingingMoments(**MOMENTS, cross_check=False),
+                                          reference_words=mix)
+    assert [(m.start, round(m.end, 1)) for m in off] == [(4.2, 7.6)]
+
+
+def test_words_only_the_mix_heard_break_the_phrase():
+    stem = _words(4.2, 8.0)
+    mix = stem[:4] + [LyricWord(word="extra", start_time=5.9, end_time=6.0)] + stem[4:]
+    bad, breaks, passages = show_rules.cross_check(stem, mix, 0.35)
+    assert bad == set() and breaks == {4} and passages[0].mix == "extra"

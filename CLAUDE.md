@@ -17,6 +17,7 @@ It has two parts, each with a `notes` list stating the rules in plain words:
 
 Read it before planning or generating a sequence, and treat it as the source of truth:
 
+- Before any change to the rules file, back it up to `<show>/backups/xlights_mcp_rules.<YYYY-MM-DD-HHMMSS>.json`.
 - When the user states a new show-wide rule, add it to the rules file (`notes` plus the
   structured field, under `safety` if it protects people or hardware, else `style`) and
   make sure the generator enforces it — not just this file.

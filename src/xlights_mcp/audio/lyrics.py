@@ -18,6 +18,7 @@ xLights phoneme codes:
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from pathlib import Path
@@ -25,6 +26,10 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_WHISPER_MODEL = "medium"
+LYRICS_SUFFIX = ".lyrics.txt"  # optional lyrics text next to the music file
+MAX_GUESSED_WORD_SECONDS = 1.0  # unheard lyric words only fill gaps this tight per word
 
 
 class PhonemeEvent(BaseModel):
@@ -52,7 +57,8 @@ class LyricTrack(BaseModel):
     track_name: str = "Lyric Track"
     source: str = "full_mix"  # "full_mix", "vocals_stem", etc.
     available: bool = False
-    confidence: float = 0.0  # mean Whisper word probability, 0–1
+    confidence: float = 0.0  # mean Whisper word probability, 0–1 (lyrics file: share of words timed)
+    lyrics_source: str = "whisper"  # "whisper", or "lyrics_file" (its words, Whisper's timing)
 
 
 # Mapping of English letter patterns to xLights phoneme codes
@@ -114,7 +120,7 @@ PHONEME_RULES: list[tuple[str, str]] = [
 
 def extract_lyrics(
     audio_path: Path,
-    whisper_model: str = "base",
+    whisper_model: str = DEFAULT_WHISPER_MODEL,
 ) -> LyricTrack:
     """Transcribe audio and generate phoneme timing track.
 
@@ -187,7 +193,7 @@ def extract_lyrics(
 
 def extract_vocal_tracks(
     audio_path: Path,
-    whisper_model: str = "base",
+    whisper_model: str = DEFAULT_WHISPER_MODEL,
 ) -> list[LyricTrack]:
     """Extract all available vocal timing tracks from an audio file.
 
@@ -235,6 +241,82 @@ def extract_vocal_tracks(
         logger.info(f"Extracted '{mix_track.track_name}' track from mix: {len(mix_track.words)} words")
 
     return tracks
+
+
+def lyrics_path_for(music_path: Path) -> Path:
+    """``<music file stem>.lyrics.txt`` next to the music file."""
+    return music_path.with_name(music_path.stem + LYRICS_SUFFIX)
+
+
+def read_lyrics_file(path: Path) -> list[str]:
+    """The words of a lyrics text file, in order. Blank lines, ``#`` comments and
+    ``[Chorus]``-style section tags are ignored."""
+    words: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or (line.startswith("[") and line.endswith("]")):
+            continue
+        words.extend(line.split())
+    return words
+
+
+def _norm(word: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", word.lower())
+
+
+def _spread(words: list[str], start: float, end: float) -> list[LyricWord]:
+    """Lay words across start–end in proportion to their length."""
+    weights = [max(1, len(_norm(w))) for w in words]
+    total, t, out = sum(weights), start, []
+    for w, n in zip(words, weights):
+        step = (end - start) * n / total
+        out.append(LyricWord(word=w, start_time=t, end_time=t + step))
+        t += step
+    return out
+
+
+def align_lyrics(track: LyricTrack, lyric_words: list[str]) -> LyricTrack:
+    """Use a lyrics file's words with the transcription's timing.
+
+    The known words are matched to Whisper's words in order. A matched word takes its
+    Whisper word's time; a run Whisper misheard takes the time span of the misheard
+    words; words Whisper didn't hear at all fill the gap between their neighbours only
+    if it's tight enough to be sung (otherwise they're left out rather than stretched
+    over an instrumental break). Words Whisper heard that aren't in the lyrics are
+    dropped. Confidence becomes the share of lyric words timed from Whisper's words.
+    """
+    heard = track.words
+    if not (heard and lyric_words):
+        return track
+    matcher = difflib.SequenceMatcher(None, [_norm(w.word) for w in heard],
+                                      [_norm(w) for w in lyric_words], autojunk=False)
+    words: list[LyricWord] = []
+    timed = 0
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            words += [LyricWord(word=lyric_words[j], start_time=heard[i].start_time, end_time=heard[i].end_time)
+                      for i, j in zip(range(i1, i2), range(j1, j2))]
+            timed += j2 - j1
+        elif op == "replace":
+            if i2 - i1 == j2 - j1:
+                words += [LyricWord(word=lyric_words[j], start_time=heard[i].start_time,
+                                    end_time=heard[i].end_time) for i, j in zip(range(i1, i2), range(j1, j2))]
+            else:
+                words += _spread(lyric_words[j1:j2], heard[i1].start_time, heard[i2 - 1].end_time)
+            timed += j2 - j1
+        elif op == "insert":  # lyric words Whisper didn't hear
+            start = words[-1].end_time if words else max(0.0, heard[0].start_time - 0.5 * (j2 - j1))
+            end = heard[i1].start_time if i1 < len(heard) else start + 0.5 * (j2 - j1)
+            if 0 < end - start <= MAX_GUESSED_WORD_SECONDS * (j2 - j1):
+                words += _spread(lyric_words[j1:j2], start, end)
+            else:
+                logger.info(f"Lyrics file: no room to time '{' '.join(lyric_words[j1:j2])}' — left out")
+        # "delete": words Whisper heard that aren't in the lyrics — dropped
+    words = [w for w in words if w.end_time > w.start_time]
+    return track.model_copy(update={
+        "words": words, "phonemes": _words_to_phonemes(words), "available": bool(words),
+        "confidence": timed / len(lyric_words), "lyrics_source": "lyrics_file",
+    })
 
 
 def _words_to_phonemes(words: list[LyricWord]) -> list[PhonemeEvent]:

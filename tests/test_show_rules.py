@@ -131,7 +131,7 @@ def test_floods_change_only_at_section_boundaries(tmp_path, monkeypatch):
 def test_big_star_only_on_final_hit(tmp_path, monkeypatch):
     _, cap = _run(tmp_path, monkeypatch)
     [hit] = _on(cap["spec"], "Big Star")
-    assert hit.start_time_ms == 28000  # beat nearest the end of the last peak
+    assert hit.start_time_ms == 30000  # no loudness data: the last downbeat
     assert hit.effect_name == "On" and float(hit.settings["T_TEXTCTRL_Fadeout"]) > 0
 
 
@@ -350,14 +350,46 @@ def test_singing_pair_mirrors_only_the_bed(tmp_path, monkeypatch):
                for e in _on(cap["spec"], "Screen", 0) if e.start_time_ms < 4000)  # mirrored in the intro
 
 
-def test_final_hit_without_a_peak_uses_the_strongest_late_hit():
+def _ending(flux_at: dict[float, float], silent_from: float, downbeats=DOWNBEATS, onsets=()):
+    """A 32 s song, loud until ``silent_from``; flux 0.5 on every downbeat unless given."""
+    from xlights_mcp.audio.spectrum import SpectrumAnalysis
+    times = [round(i * 0.05, 2) for i in range(640)]
+    flux = [0.05] * len(times)
+    for d in DOWNBEATS + [32.0]:
+        if d < 32:
+            flux[int(round(d / 0.05))] = flux_at.get(d, 0.5)
+    rms = [0.8 if t < silent_from else 0.0 for t in times]
+    return SongAnalysis(
+        file_path="s.mp3", file_name="s.mp3", duration_seconds=32.0,
+        beats=BeatMap(tempo=120.0, beat_times=BEATS, downbeat_times=list(downbeats), onset_times=list(onsets)),
+        sections=SECTIONS, spectrum=SpectrumAnalysis(rms_times=times, spectral_flux=flux, rms_energy=rms),
+    )
+
+
+def test_final_hit_is_the_last_strong_downbeat_before_the_music_ends():
+    # Silent from 29 s; the 28 s downbeat is only a chord ringing out (no attack)
+    analysis = _ending({28.0: 0.1}, silent_from=29.0, onsets=[26.02])
+    assert show_rules.music_end_time(analysis) == pytest.approx(28.95)
+    assert show_rules.final_hit_time(analysis, ["normal", "normal", "peak", "breather"], None) == 26.02
+    # Not the end of the last peak (28 s), even when that's strong
+    analysis = _ending({}, silent_from=29.0)
+    assert show_rules.final_hit_time(analysis, ["normal", "peak", "normal", "breather"], None) == 28.0
+
+
+def test_final_hit_finds_a_closing_button_past_the_tracked_downbeats():
+    # The tracker stopped at 24 s, but the music runs to 31 s with a big hit at 28 s
+    analysis = _ending({28.0: 0.9, 30.0: 0.1}, silent_from=31.0, downbeats=DOWNBEATS[:13])
+    assert show_rules.final_hit_time(analysis, ["normal"] * 4, None) == 28.0
+
+
+def test_final_hit_without_downbeats_uses_the_strongest_late_hit():
     from xlights_mcp.audio.spectrum import SpectrumAnalysis
     times = [i * 0.5 for i in range(64)]
     flux = [0.1] * 64
     flux[20], flux[58] = 1.0, 0.8  # 10 s is the loudest overall, but outside the last 15 s
     analysis = SongAnalysis(
         file_path="s.mp3", file_name="s.mp3", duration_seconds=32.0,
-        beats=BeatMap(tempo=120.0, beat_times=BEATS, downbeat_times=DOWNBEATS, onset_times=[29.02]),
+        beats=BeatMap(tempo=120.0, beat_times=BEATS, downbeat_times=[], onset_times=[29.02]),
         sections=SECTIONS, spectrum=SpectrumAnalysis(rms_times=times, spectral_flux=flux),
     )
     assert show_rules.final_hit_time(analysis, ["normal"] * 4, None) == 29.02  # 29.0 s snapped to the onset
@@ -401,3 +433,23 @@ def test_rules_naming_unknown_models_are_rejected():
     show = ShowConfig(show_path="", show_name="t", models=MODELS, model_groups=GROUPS)
     with pytest.raises(ValueError, match="Unknown model or group: 'Nope'"):
         show_rules.validate_models(ShowRules.model_validate({"style": {"floods": ["Nope"]}}), show)
+
+
+def test_adjacent_songs_share_no_signature_color(tmp_path):
+    rules = ShowRules.model_validate(RULES)  # pool: #7B2FBE #00A6A6 #E0218A #2546F0 #FF7A1A
+    show_rules.record_signatures(tmp_path, "05 Jingle", ["#7B2FBE", "#00A6A6"])
+    show_rules.record_signatures(tmp_path, "08 Silent", ["#00A6A6", "#E0218A"])
+    show_rules.record_signatures(tmp_path, "Untracked", ["#2546F0", "#7B2FBE"])
+    registry = show_rules._read_registry(tmp_path)
+    assert show_rules.adjacent_songs("06 Holly", registry) == ["05 Jingle", "08 Silent"]
+    assert show_rules.adjacent_songs("Untracked", registry) == []
+    assert sorted(show_rules.pick_signatures(rules, tmp_path, "06 Holly", None)) == ["#2546F0", "#FF7A1A"]
+    with pytest.raises(ValueError, match="also used by '0[58] [A-Za-z]+', next to this song"):
+        show_rules.pick_signatures(rules, tmp_path, "06 Holly", ["#00A6A6", "#FF7A1A"])
+    # Songs that aren't neighbors may share a color (Untracked has #2546F0 too)
+    assert show_rules.pick_signatures(rules, tmp_path, "06 Holly", ["#2546F0", "#FF7A1A"]) == ["#2546F0", "#FF7A1A"]
+    # 05 and 08 aren't neighbors either once 06 is in the show, but are without it
+    assert show_rules.adjacent_songs("08 Silent", registry) == ["05 Jingle"]
+    off = ShowRules.model_validate({**RULES, "style": {**STYLE, "palettes": {**STYLE["palettes"],
+                                                                            "adjacent_songs_distinct": False}}})
+    assert show_rules.pick_signatures(off, tmp_path, "06 Holly", ["#00A6A6", "#FF7A1A"]) == ["#00A6A6", "#FF7A1A"]

@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import bisect
 import colorsys
+import difflib
 import hashlib
 import itertools
 import json
 import logging
 import math
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -93,17 +95,26 @@ class Twinkle(_Strict):
 class FinalHit(_Strict):
     models: list[str]
     bars: float = Field(default=2, gt=0)  # how long the hit holds before fading out
+    overrides_calm_bed: bool = True  # in a singing moment, the whole yard hits with the star
 
 
 class SingingMoments(_Strict):
-    """When faces sing: only in vocal feature moments, as whole phrases, capped."""
+    """When faces sing: only in vocal feature moments, as whole phrases, capped.
 
-    vocal_drum_ratio: float = Field(default=3.0, gt=0)  # vocal stem level ÷ drum stem level
+    Vocal exposure (vocal stem level ÷ drum stem level) is ranked within each song, like
+    section energy, so the faces get the song's most exposed phrases whatever its mix.
+    """
+
+    exposed_fraction: float = Field(default=0.25, gt=0, le=1)  # most exposed share of eligible phrases
+    min_vocal_drum_ratio: float = Field(default=1.0, ge=0)  # floor: vocals at least as loud as drums
     max_drum_onsets_per_beat: float = Field(default=1.0, gt=0)  # at or under: sparse drums
     max_drum_irregularity: float = Field(default=0.35, ge=0)  # inter-onset spread ÷ mean: steady
     max_share: float = Field(default=0.25, ge=0, le=1)  # of the song
     min_phrase_bars: float = Field(default=1.0, ge=0)
+    max_phrase_bars: float = Field(default=8.0, gt=0)  # longer phrases split at their longest pauses
     phrase_gap_seconds: float = Field(default=0.75, gt=0)  # a longer silence ends a phrase
+    cross_check: bool = True  # no singing where the vocal-stem and full-mix transcriptions disagree
+    max_cross_check_offset_seconds: float = Field(default=0.35, ge=0)  # same word, start times this close
     merge_gap_bars: float = Field(default=1.0, ge=0)  # phrases closer than this sing as one moment
     avoid_tiers: list[Tier] = Field(default_factory=lambda: ["peak"])
     peak_lead_bars: float = Field(default=1.0, ge=0)  # moments end at least this long before a peak
@@ -146,6 +157,7 @@ class Palettes(_Strict):
     arch_chase: str | None = None
     accent_pool: list[str] = Field(default_factory=list)
     signatures_per_song: int = Field(default=2, ge=1, le=2)
+    adjacent_songs_distinct: bool = True  # songs next to each other in show order share no signature color
     max_accent_share: float = Field(default=0.25, ge=0, le=1)
 
     @field_validator("core")
@@ -325,29 +337,74 @@ def finale_range(
     return analysis.sections[first].start_time, analysis.sections[last[-1]].end_time
 
 
-FINAL_HIT_WINDOW = 15.0  # seconds: no peak → the strongest hit this close to the end
+FINAL_HIT_WINDOW = 15.0  # seconds: no downbeats → the strongest hit this close to the end
+SILENCE_LEVEL = 0.05  # normalized RMS under this is silence: where the music ends
+STRONG_ATTACK = 0.75  # a strong downbeat's attack is at least this × the song's median downbeat
+STRONG_LEVEL = 0.5  # ...and its loudness at least this × the median downbeat's (no faint clicks)
+DOWNBEAT_WINDOW = (-0.05, 0.15)  # seconds around a downbeat that its attack can land in
+ONSET_SNAP = 0.06  # seconds: the hit snaps to an onset this close
+
+
+def music_end_time(analysis: SongAnalysis) -> float:
+    """Where the audio goes silent for good (the file's end if it never does)."""
+    spec = analysis.spectrum
+    loud = [t for r, t in zip(spec.rms_energy, spec.rms_times) if r >= SILENCE_LEVEL]
+    return min(loud[-1], analysis.duration_seconds) if loud else analysis.duration_seconds
+
+
+def _extended_downbeats(analysis: SongAnalysis, end: float) -> list[float]:
+    """The downbeat grid carried on to the end of the music: beat trackers often stop
+    before a song's closing button, which then falls a bar past the last tracked downbeat."""
+    downbeats = [d for d in analysis.beats.downbeat_times if d < end]
+    if len(downbeats) >= 2:
+        gaps = sorted(b - a for a, b in itertools.pairwise(downbeats))
+        bar = gaps[len(gaps) // 2]
+        while downbeats[-1] + bar < end:
+            downbeats.append(downbeats[-1] + bar)
+    return downbeats
+
+
+def _window_max(values: list[float], times: list[float], t: float) -> float:
+    lo, hi = bisect.bisect_left(times, t + DOWNBEAT_WINDOW[0]), bisect.bisect_right(times, t + DOWNBEAT_WINDOW[1])
+    return max(values[lo:hi], default=0.0)
+
+
+def _snap_to_onset(analysis: SongAnalysis, t: float) -> float:
+    onsets = [o for o in analysis.beats.onset_times if abs(o - t) <= ONSET_SNAP]
+    return min(onsets, key=lambda o: abs(o - t)) if onsets else t
 
 
 def final_hit_time(
     analysis: SongAnalysis, tiers: list[str], song_settings: SongSettings | None,
 ) -> float | None:
-    """The final hit: per-song override, else the beat nearest the end of the last peak,
-    else (a song with no peak) the strongest hit in the last 15 seconds."""
+    """The final hit: per-song override, else the last strong downbeat before the music
+    ends, snapped to its onset.
+
+    The music ends where the audio goes silent (``SILENCE_LEVEL``). A downbeat is strong
+    when it has a real attack (spectral flux) and loudness compared with the song's
+    median downbeat, so a chord left ringing into the fade doesn't count. Without
+    downbeats, the strongest attack in the last 15 seconds of music.
+    """
     if song_settings and song_settings.final_hit is not None:
         return song_settings.final_hit
-    beats = analysis.beats.beat_times
-    peaks = [i for i, t in enumerate(tiers) if t == "peak"]
-    if peaks:
-        t = analysis.sections[peaks[-1]].end_time
-        return min(beats, key=lambda b: abs(b - t)) if beats else t
     spec = analysis.spectrum
-    lo = analysis.duration_seconds - FINAL_HIT_WINDOW
-    window = [(f, t) for f, t in zip(spec.spectral_flux, spec.rms_times) if t >= lo]
+    end = music_end_time(analysis)
+    downbeats = _extended_downbeats(analysis, end)
+    if downbeats:
+        if not spec.spectral_flux:
+            return downbeats[-1]
+        attack = [_window_max(spec.spectral_flux, spec.rms_times, d) for d in downbeats]
+        level = ([_window_max(spec.rms_energy, spec.rms_times, d) for d in downbeats]
+                 if spec.rms_energy else [1.0] * len(downbeats))
+        typical_attack, typical_level = statistics.median(attack), statistics.median(level)
+        for d, a, lv in zip(reversed(downbeats), reversed(attack), reversed(level)):
+            if a >= STRONG_ATTACK * typical_attack and lv >= STRONG_LEVEL * typical_level:
+                return _snap_to_onset(analysis, d)
+        return _snap_to_onset(analysis, downbeats[-1])
+    window = [(f, t) for f, t in zip(spec.spectral_flux, spec.rms_times) if end - FINAL_HIT_WINDOW <= t <= end]
     if not window:
         return None
-    t = max(window)[1]  # largest spectral flux = the sharpest attack
-    onsets = [o for o in analysis.beats.onset_times if abs(o - t) <= 0.06]
-    return min(onsets, key=lambda o: abs(o - t)) if onsets else t
+    return _snap_to_onset(analysis, max(window)[1])  # largest spectral flux = the sharpest attack
 
 
 def check_strobes(
@@ -517,6 +574,14 @@ class SingingMoment:
 
 
 @dataclass
+class DisputedPassage:
+    start: float
+    end: float
+    stem: str  # what the vocal-stem transcription heard
+    mix: str   # what the full-mix transcription heard over the same stretch
+
+
+@dataclass
 class TrimmedPhrase:
     start: float
     end: float
@@ -541,15 +606,91 @@ def _peak_limits(analysis: SongAnalysis, tiers: list[str], cfg: SingingMoments, 
     return limits
 
 
+def _split_phrase(words: list, max_seconds: float, min_seconds: float) -> list[list]:
+    """Split a phrase longer than ``max_seconds`` at its longest pauses, recursively,
+    never leaving a piece shorter than ``min_seconds``; a phrase that can't be split that
+    way stays whole."""
+    span = words[-1].end_time - words[0].start_time
+    if span <= max_seconds or len(words) < 2:
+        return [words]
+    mid = (words[0].start_time + words[-1].end_time) / 2
+    cuts = sorted(range(1, len(words)), key=lambda i: (
+        -(words[i].start_time - words[i - 1].end_time),  # longest pause first
+        abs(words[i].start_time - mid),                  # then the most even split
+    ))
+    for i in cuts:
+        left, right = words[:i], words[i:]
+        if (left[-1].end_time - left[0].start_time >= min_seconds
+                and right[-1].end_time - right[0].start_time >= min_seconds):
+            return _split_phrase(left, max_seconds, min_seconds) + _split_phrase(right, max_seconds, min_seconds)
+    return [words]
+
+
+def _norm_word(word: str) -> str:
+    return "".join(ch for ch in word.lower() if ch.isalnum())
+
+
+def cross_check(words, reference, max_offset: float) -> tuple[set[int], set[int], list[DisputedPassage]]:
+    """Where the vocal-stem transcription (``words``) and the full-mix one (``reference``)
+    disagree.
+
+    The two are aligned word by word. Stem words the mix heard differently or not at all
+    (a different word count), or heard more than ``max_offset`` seconds apart, are
+    disputed; words only the mix heard break the stem phrase where they fall. Returns the
+    disputed stem word indices, the indices a phrase must break before, and the passages.
+    """
+    matcher = difflib.SequenceMatcher(None, [_norm_word(w.word) for w in words],
+                                      [_norm_word(w.word) for w in reference], autojunk=False)
+    disputed: set[int] = set()
+    breaks: set[int] = set()
+    passages: list[DisputedPassage] = []
+
+    def passage(i1, i2, j1, j2):
+        ours, theirs = words[i1:i2], reference[j1:j2]
+        times = [w.start_time for w in ours + theirs] + [w.end_time for w in ours + theirs]
+        passages.append(DisputedPassage(round(min(times), 2), round(max(times), 2),
+                                        " ".join(w.word for w in ours), " ".join(w.word for w in theirs)))
+
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":  # same words: they must also be heard at the same time
+            runs: list[list[int]] = []
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                if abs(words[i].start_time - reference[j].start_time) > max_offset:
+                    disputed.add(i)
+                    if runs and runs[-1][1] == i:
+                        runs[-1][1], runs[-1][3] = i + 1, j + 1
+                    else:
+                        runs.append([i, i + 1, j, j + 1])
+            for run in runs:
+                passage(*run)
+        elif op in ("replace", "delete"):
+            disputed.update(range(i1, i2))
+            passage(i1, i2, j1, j2)
+        elif op == "insert":
+            breaks.add(i1)
+            passage(i1, i1, j1, j2)
+    return disputed, breaks, passages
+
+
 def pick_singing_moments(
     words, analysis: SongAnalysis, tiers: list[str], cfg: SingingMoments, trimmed: list | None = None,
+    reference_words=None, disputed: list | None = None,
 ) -> list[SingingMoment]:
-    """Whole lyric phrases where the vocal stem clearly dominates steady or sparse drums,
-    loudest-vocal first, up to ``max_share`` of the song. Needs separated stems.
+    """The song's most exposed vocal phrases over steady or sparse drums, most exposed
+    first, up to ``max_share`` of the song. Needs separated stems.
 
-    Phrases that would end too close to a peak, or run into the build before one, are
-    dropped from their moment (it's trimmed to its earlier phrases); they're appended to
-    ``trimmed`` if given.
+    Exposure (vocal stem level ÷ drum stem level) is ranked within the song: of the
+    eligible phrases, the top ``exposed_fraction`` qualify (at least one, and never below
+    ``min_vocal_drum_ratio``). Phrases longer than ``max_phrase_bars`` are first split at
+    their longest pauses, never into pieces shorter than ``min_phrase_bars``.
+
+    With ``reference_words`` (the full-mix transcription) and ``cross_check``, words the
+    two transcriptions disagree on are never sung and break their phrase; the passages are
+    appended to ``disputed`` if given.
+
+    Qualifying phrases that would end too close to a peak, or run into the build before
+    one, are dropped from their moment (it's trimmed to its earlier phrases); they're
+    appended to ``trimmed`` if given.
     """
     stems = analysis.stem_analysis
     if not (words and stems.available and "vocals" in stems.stems and "drums" in stems.stems):
@@ -559,14 +700,29 @@ def pick_singing_moments(
     avoid = [s for s, t in zip(analysis.sections, tiers) if t in cfg.avoid_tiers]
     limits = _peak_limits(analysis, tiers, cfg, bar)
 
-    phrases = [[words[0]]]
-    for w in words[1:]:
-        if w.start_time - phrases[-1][-1].end_time > cfg.phrase_gap_seconds:
-            phrases.append([w])
-        else:
-            phrases[-1].append(w)
+    # Never sing where the stem and mix transcriptions disagree: drop those words and
+    # break the phrase there
+    bad: set[int] = set()
+    breaks: set[int] = set()
+    if cfg.cross_check and reference_words:
+        bad, breaks, passages = cross_check(words, reference_words, cfg.max_cross_check_offset_seconds)
+        if disputed is not None:
+            disputed.extend(passages)
+    phrases: list[list] = []
+    current: list = []
+    for i, w in enumerate(words):
+        if i in bad or i in breaks or (current and w.start_time - current[-1].end_time > cfg.phrase_gap_seconds):
+            if current:
+                phrases.append(current)
+            current = []
+        if i not in bad:
+            current.append(w)
+    if current:
+        phrases.append(current)
+    phrases = [piece for p in phrases
+               for piece in _split_phrase(p, cfg.max_phrase_bars * bar, cfg.min_phrase_bars * bar)]
 
-    candidates = []
+    eligible = []
     for p in phrases:
         a, b = p[0].start_time, p[-1].end_time
         if b - a < cfg.min_phrase_bars * bar:
@@ -575,7 +731,7 @@ def pick_singing_moments(
             continue
         drums = stems.get_level_in_range("drums", a, b)
         ratio = stems.get_level_in_range("vocals", a, b) / drums if drums > 0 else float("inf")
-        if ratio < cfg.vocal_drum_ratio:
+        if ratio < cfg.min_vocal_drum_ratio:
             continue
         onsets = stems.get_onsets_in_range("drums", a, b)
         sparse = len(onsets) / ((b - a) / beat) <= cfg.max_drum_onsets_per_beat
@@ -585,7 +741,14 @@ def pick_singing_moments(
             (sum((g - mean) ** 2 for g in gaps) / len(gaps)) ** 0.5 / mean <= cfg.max_drum_irregularity)
         if not (sparse or steady):
             continue
-        text = " ".join(w.word for w in p)
+        eligible.append((ratio, a, b, " ".join(w.word for w in p)))
+
+    # Rank within the song, like section energy: only the most exposed phrases qualify
+    eligible.sort(key=lambda c: -c[0])
+    exposed = eligible[:max(1, round(len(eligible) * cfg.exposed_fraction))] if eligible else []
+
+    candidates = []
+    for ratio, a, b, text in sorted(exposed, key=lambda c: c[1]):
         # Must finish before every peak's lead-in (and its build) that comes after it starts
         breach = next((why for latest, peak, why in limits if a < peak and b > latest), None)
         if breach:
@@ -622,13 +785,35 @@ def apply_singing(
     show_config: ShowConfig,
     rules: ShowRules,
     preset,
+    final_hit: float | None = None,
+    beat_seconds: float = 0.5,
+    hit_effect=None,  # model name → (xLights effect name, settings) for its final-hit accent
 ) -> list[EffectPlacement]:
-    """Faces sing in the moments; everything else drops to a calm bed meanwhile."""
+    """Faces sing in the moments; everything else drops to a calm bed meanwhile.
+
+    With ``final_hit.overrides_calm_bed``, a moment the final hit falls in keeps the calm
+    bed only until the hit: from there the other props get their regular effects back and
+    the whole yard accents the hit with the star, while the faces finish the phrase.
+    Floods and excluded models are left alone.
+    """
     gentle = [preset(k) for k in cfg.gentle_motion]
     hit_models = set(expand_models(rules.style.final_hit.models, show_config)) if rules.style.final_hit else set()
+    yard_hits = bool(rules.style.final_hit and rules.style.final_hit.overrides_calm_bed and final_hit is not None)
+    skip = set(expand_models([*rules.style.floods, *rules.safety.exclude], show_config))
     bed_name, bed_settings = preset("ColorWash_slow")
     for m in moments:
         lo, hi = int(m.start * 1000), int(m.end * 1000)
+        others = [x.name for x in show_config.models if x.name not in singers and x.name not in hit_models]
+        calm_hi = hi
+        if yard_hits and lo <= final_hit * 1000 < hi:
+            calm_hi = int(final_hit * 1000)
+            name_hit = hit_effect or (lambda _: preset("Shockwave_hit"))
+            yard = [name for name in others if name not in skip]
+            hit_end = calm_hi + int(beat_seconds * 1000)
+            effects = clip_out(effects, yard, 2, calm_hi, hit_end)
+            for name in yard:
+                effect, settings = name_hit(name)
+                effects.append(_effect(name, 2, effect, calm_hi, hit_end, settings))
         # Singers: just a calm bed and the face
         effects = clip_out(effects, list(singers), None, lo, hi)
         for name, face in singers.items():
@@ -643,16 +828,17 @@ def apply_singing(
                 "T_TEXTCTRL_Fadein": "0.3",
                 "T_TEXTCTRL_Fadeout": "0.3",
             }))
-        # Everyone else: no accent hits, and only gentle motion
-        others = [x.name for x in show_config.models if x.name not in singers and x.name not in hit_models]
-        effects = clip_out(effects, others, 2, lo, hi)
+        # Everyone else: no accent hits, and only gentle motion (until the final hit)
+        if calm_hi <= lo:
+            continue
+        effects = clip_out(effects, others, 2, lo, calm_hi)
         busy = [e for e in effects if e.layer == 1 and e.model_name in others
-                and e.end_time_ms > lo and e.start_time_ms < hi
+                and e.end_time_ms > lo and e.start_time_ms < calm_hi
                 and (e.effect_name, e.settings) not in gentle]
         busy_ids = {id(e) for e in busy}
         effects = [e for e in effects if id(e) not in busy_ids]
-        for e in busy:  # keep the parts outside the moment
-            effects += clip_out([e], [e.model_name], 1, lo, hi)
+        for e in busy:  # keep the parts outside the calm stretch
+            effects += clip_out([e], [e.model_name], 1, lo, calm_hi)
     return effects
 
 
@@ -686,18 +872,29 @@ def pick_signatures(
 ) -> list[str]:
     """This song's signature accent colors: a set no other song in the show has.
 
-    With two per song, a pool of n colors gives n*(n-1)/2 unique pairs. Raises ValueError
-    if an override duplicates another song's set or the pool has no unused set left.
+    Single colors may recur in different sets, but with ``adjacent_songs_distinct`` the
+    songs either side of this one in show order (by track-number prefix, see
+    ``show_position``) share none of its colors. With two per song, a pool of n colors
+    gives n*(n-1)/2 unique pairs. Raises ValueError if an override breaks either rule or no
+    usable set is left in the pool.
     """
     registry = _read_registry(show_path)
     taken = {frozenset(colors): s for s, colors in registry.items() if s != song}
+    neighbors = (adjacent_songs(song, registry) if rules.style.palettes.adjacent_songs_distinct else [])
+    near = {c: s for s in neighbors for c in registry[s]}
+
+    def clash(colors):
+        return next(((c, near[c]) for c in colors if c in near), None)
+
     if override:
         if frozenset(override) in taken:
             raise ValueError(
                 f"Signature colors {override} are already used by '{taken[frozenset(override)]}'"
             )
+        if hit := clash(override):
+            raise ValueError(f"Signature color {hit[0]} is also used by '{hit[1]}', next to this song in show order")
         return override
-    if song in registry and frozenset(registry[song]) not in taken:
+    if song in registry and frozenset(registry[song]) not in taken and not clash(registry[song]):
         return registry[song]
     pool = rules.style.palettes.accent_pool
     n = rules.style.palettes.signatures_per_song
@@ -706,12 +903,40 @@ def pick_signatures(
     options = [list(c) for c in itertools.combinations(pool, n)]
     start = int(hashlib.md5(song.encode()).hexdigest(), 16) % len(options)
     for colors in options[start:] + options[:start]:
-        if frozenset(colors) not in taken:
+        if frozenset(colors) not in taken and not clash(colors):
             return colors
+    if near:
+        raise ValueError(
+            f"No signature color set in the accent pool is both unused and free of the colors of "
+            f"{', '.join(repr(s) for s in neighbors)} (next to this song in show order); "
+            "add colors to palettes.accent_pool"
+        )
     raise ValueError(
         f"All {len(options)} signature color sets in the accent pool are used by other songs; "
         "add colors to palettes.accent_pool"
     )
+
+
+def show_position(song: str) -> int | None:
+    """A song's place in the show: its track-number prefix ("06 Holly Jolly" → 6)."""
+    digits = ""
+    for ch in song.lstrip():
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else None
+
+
+def adjacent_songs(song: str, registry: dict[str, list[str]]) -> list[str]:
+    """The registered songs immediately before and after this one in show order (none
+    for a song without a track-number prefix)."""
+    me = show_position(song)
+    if me is None:
+        return []
+    placed = [(pos, s) for s in registry if s != song and (pos := show_position(s)) is not None and pos != me]
+    before = [x for x in placed if x[0] < me]
+    after = [x for x in placed if x[0] > me]
+    return [x[1] for x in (max(before, default=None), min(after, default=None)) if x]
 
 
 def _read_registry(show_path: Path) -> dict[str, list[str]]:

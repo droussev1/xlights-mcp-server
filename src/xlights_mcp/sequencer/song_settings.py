@@ -12,7 +12,7 @@ All fields are optional:
       ],
       "signature_colors": ["#7B2FBE"], # this song's accent colors (overrides the show's pick)
       "final_hit": 113.0,              # seconds; overrides the detected final hit
-      "singing": {"vocal_drum_ratio": 2.5, "max_share": 0.3},  # singing-moment overrides
+      "singing": {"exposed_fraction": 0.4, "max_share": 0.3},  # singing-moment overrides
       "effects": [                     # custom effects, replacing generated ones on the
         {                              # same models/layer within their time range
           "section": "climax",         # a mark name, or "start"/"end" in seconds

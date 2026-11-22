@@ -88,7 +88,7 @@ def _section_boundaries(
         novelty, pre_max=4, post_max=4, pre_avg=8, post_avg=8, delta=0.1, wait=8
     )
     candidates = [float(times[i]) for i in peaks if i < len(times)]
-    if (beats.downbeat_confidence > 0 or beats.rhythm_method == "madmom") and beats.downbeat_times:
+    if ((beats.downbeat_confidence or 0) > 0 or beats.rhythm_method == "madmom") and beats.downbeat_times:
         bars = np.asarray(beats.downbeat_times)
         tolerance = min(1.0, 30 / max(beats.tempo, 1))
         candidates = [

@@ -653,7 +653,8 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
             "white_only_seconds": {k: round(v, 2) for k, v in white_only.items()},
             "lyrics": plan["lyrics"],
             "vocal_assignments": plan["vocal_assignments"],
-            "singing": _moments_summary(plan["singing_moments"], analysis, plan["trimmed_phrases"]),
+            "singing": _moments_summary(plan["singing_moments"], analysis, plan["trimmed_phrases"],
+                                        plan["disputed_passages"]),
         },
         "props": {k: {"effects": v["effects"], "sections_lit": len(v["sections_lit"])}
                   for k, v in sorted(props.items())},
@@ -754,6 +755,8 @@ def _generate_auto(
     if vocal_tracks:
         default_track = next((t for t in vocal_tracks if t.source == "vocals_stem"), vocal_tracks[0])
         lyrics_status = f"'{default_track.track_name}' confidence {default_track.confidence:.2f}"
+        if default_track.lyrics_source == "lyrics_file":
+            lyrics_status += " (lyrics file words, Whisper timing)"
         if default_track.confidence < min_conf:
             lyrics_status += f" < {min_conf:.2f}: treated as no faces"
             vocal_tracks = []
@@ -1121,6 +1124,7 @@ def _generate_auto(
     share = finale = final_hit = None
     singing_moments: list = []
     trimmed_phrases: list = []
+    disputed_passages: list = []
     if show_rules:
         finale = show_rules_mod.finale_range(analysis, section_tiers, song_settings)
         final_hit = show_rules_mod.final_hit_time(analysis, section_tiers, song_settings)
@@ -1132,13 +1136,22 @@ def _generate_auto(
         # Style: faces sing only in vocal feature moments; other props calm down meanwhile
         if moments_cfg and has_lyrics and singing_models:
             stem_track = next((t for t in vocal_tracks if t.source == "vocals_stem"), None)
+            mix_track = next((t for t in vocal_tracks if t.source == "full_mix"), None)
             singing_moments = show_rules_mod.pick_singing_moments(
                 stem_track.words if stem_track else [], analysis, section_tiers, moments_cfg,
-                trimmed=trimmed_phrases,
+                trimmed=trimmed_phrases, reference_words=mix_track.words if mix_track else None,
+                disputed=disputed_passages,
             )
+            category = {m.name: m.model_category for m in show_config.models}
+
+            def hit_effect(name):
+                key = ACCENT_EFFECTS.get(category.get(name, "other"), ACCENT_EFFECTS["other"])[0]
+                return _effect_name_from_key(key), _get_settings(key)
+
             all_effects = show_rules_mod.apply_singing(
                 all_effects, singing_moments, singing_models, face_tracks, moments_cfg, show_config,
                 show_rules, preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
+                final_hit=final_hit, beat_seconds=60 / max(analysis.beats.tempo, 1), hit_effect=hit_effect,
             )
         # Safety: strobes only in the finale, at the required spacing
         strobe_presets = {k for k in EFFECT_VARIANTS if _effect_name_from_key(k) == "Strobe"}
@@ -1185,7 +1198,7 @@ def _generate_auto(
             "spec": spec, "plan_id": plan_id, "analysis": analysis, "tiers": section_tiers,
             "finale": finale, "final_hit": final_hit, "signatures": signatures, "share": share,
             "lyrics": lyrics_status, "priority_of": priority_of, "singing_moments": singing_moments,
-            "trimmed_phrases": trimmed_phrases,
+            "trimmed_phrases": trimmed_phrases, "disputed_passages": disputed_passages,
             "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
         }
 
@@ -1221,7 +1234,7 @@ def _generate_auto(
         "singing_models": list(singing_models.keys()) if has_lyrics else [],
         "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
         "lyrics": lyrics_status,
-        "singing_moments": _moments_summary(singing_moments, analysis, trimmed_phrases),
+        "singing_moments": _moments_summary(singing_moments, analysis, trimmed_phrases, disputed_passages),
         "signature_colors": signatures,
         "accent_share": share,
         "plan_id": plan_id,
@@ -1319,9 +1332,15 @@ def _effect_name_from_key(variant_key: str) -> str:
     return key_to_effect.get(variant_key, variant_key.split("_")[0])
 
 
-def _moments_summary(moments: list, analysis: SongAnalysis, trimmed: list | None = None) -> dict:
+def _moments_summary(
+    moments: list, analysis: SongAnalysis, trimmed: list | None = None, disputed: list | None = None,
+) -> dict:
     total = sum(m.end - m.start for m in moments)
     return {
+        "disputed_passages": [
+            {"start": f"{d.start:.2f}s", "end": f"{d.end:.2f}s", "vocal_stem": d.stem, "full_mix": d.mix}
+            for d in disputed or []
+        ],
         "trimmed_phrases": [
             {"start": f"{t.start:.2f}s", "end": f"{t.end:.2f}s", "reason": t.reason, "lyrics": t.lyrics}
             for t in trimmed or []
@@ -1403,8 +1422,8 @@ def _precompute_section_downbeats(analysis: SongAnalysis) -> dict[int, list[floa
 def _try_extract_lyrics(mp3_path: Path):
     """Try to extract lyrics using Whisper. Returns None if unavailable."""
     try:
-        from xlights_mcp.audio.lyrics import extract_lyrics
-        return extract_lyrics(mp3_path, whisper_model="base")
+        from xlights_mcp.audio.lyrics import DEFAULT_WHISPER_MODEL, extract_lyrics
+        return extract_lyrics(mp3_path, whisper_model=DEFAULT_WHISPER_MODEL)
     except ImportError:
         logger.info("Whisper not installed — skipping lyric extraction")
         return None
@@ -1413,21 +1432,46 @@ def _try_extract_lyrics(mp3_path: Path):
         return None
 
 
-LYRICS_CACHE_VERSION = 1
+LYRICS_CACHE_VERSION = 2
 
 
 def _try_extract_vocal_tracks(mp3_path: Path) -> list:
-    """Extract all vocal timing tracks (cached per audio file). Empty list if unavailable.
+    """Vocal timing tracks for a song. Empty list if unavailable.
+
+    With a ``<song>.lyrics.txt`` next to the music file, its words replace Whisper's and
+    Whisper supplies only the timing.
+    """
+    from xlights_mcp.audio.lyrics import align_lyrics, lyrics_path_for, read_lyrics_file
+
+    tracks = _transcribe_vocal_tracks(mp3_path)
+    lyrics_file = lyrics_path_for(mp3_path)
+    if tracks and lyrics_file.is_file():
+        try:
+            lyric_words = read_lyrics_file(lyrics_file)
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(f"Couldn't read {lyrics_file.name}, using the transcription: {e}")
+            return tracks
+        if lyric_words:
+            tracks = [t for t in (align_lyrics(t, lyric_words) for t in tracks) if t.available and t.phonemes]
+            logger.info(f"Lyrics from {lyrics_file.name}, timed by Whisper")
+    return tracks
+
+
+def _transcribe_vocal_tracks(mp3_path: Path) -> list:
+    """Whisper transcriptions of the vocal stem and the mix (cached per audio file and model).
 
     Transcriptions are cached so a preview and the sequence it previews see the same
-    lyrics — Whisper can transcribe the same audio differently from run to run.
+    lyrics — Whisper can transcribe the same audio differently from run to run — and so
+    editing a lyrics file doesn't re-run Whisper.
     """
-    from xlights_mcp.audio.lyrics import LyricTrack
+    from xlights_mcp.audio.lyrics import DEFAULT_WHISPER_MODEL, LyricTrack
     from xlights_mcp.config import AUDIO_CACHE_DIR
 
     try:
         st = mp3_path.stat()
-        key = hashlib.sha1(f"{mp3_path.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
+        key = hashlib.sha1(
+            f"{mp3_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{DEFAULT_WHISPER_MODEL}".encode()
+        ).hexdigest()
         cache = AUDIO_CACHE_DIR / f"lyrics-v{LYRICS_CACHE_VERSION}-{key}.json"
     except OSError:
         cache = None
@@ -1439,7 +1483,8 @@ def _try_extract_vocal_tracks(mp3_path: Path) -> list:
 
     try:
         from xlights_mcp.audio.lyrics import extract_vocal_tracks
-        tracks = [t for t in extract_vocal_tracks(mp3_path, whisper_model="base") if t.available and t.phonemes]
+        tracks = [t for t in extract_vocal_tracks(mp3_path, whisper_model=DEFAULT_WHISPER_MODEL)
+                  if t.available and t.phonemes]
     except Exception as e:
         logger.warning(f"Vocal track extraction failed: {e}")
         track = _try_extract_lyrics(mp3_path)

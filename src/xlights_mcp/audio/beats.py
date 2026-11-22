@@ -8,7 +8,7 @@ from pathlib import Path
 
 import librosa
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +39,29 @@ class BeatMap(BaseModel):
     downbeat_times: list[float] = Field(default_factory=list)  # bar start times
     onset_times: list[float] = Field(default_factory=list)  # note onset times
     beats_per_bar: int = 4
-    meter_confidence: float = 0.0
-    downbeat_confidence: float = 0.0
+    # Heuristic evidence scores; None ("n/a") when madmom picked the grid, since its
+    # model output isn't a calibrated probability
+    meter_confidence: float | None = 0.0
+    downbeat_confidence: float | None = 0.0
     rhythm_method: str = "librosa"
     tempo_curve: list[TempoPoint] = Field(default_factory=list)
     tempo_changes: list[TempoChange] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("meter_confidence", "downbeat_confidence", mode="before")
+    @classmethod
+    def _parse_not_applicable(cls, v):
+        return None if v == "n/a" else v
+
+    @model_validator(mode="after")
+    def _madmom_has_no_confidence(self):
+        if self.rhythm_method == "madmom":
+            self.meter_confidence = self.downbeat_confidence = None
+        return self
+
+    @field_serializer("meter_confidence", "downbeat_confidence")
+    def _show_not_applicable(self, v: float | None):
+        return "n/a" if v is None else v
 
     @property
     def beat_times_ms(self) -> list[int]:
@@ -210,8 +227,8 @@ def _analyze_beats(
         if len(beat_times) > 1:
             tempo_val = float(60 / np.median(np.diff(beat_times)))
         method = "madmom"
-        # Model output is not a calibrated probability.
-        confidence = phase_confidence = 0.0
+        # Model output is not a calibrated probability: reported as n/a.
+        confidence = phase_confidence = None
     curve = _tempo_windows(onset_env, sr, duration)
     changes = [
         TempoChange(time=b.time, from_tempo=a.tempo, to_tempo=b.tempo)
