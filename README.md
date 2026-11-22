@@ -358,6 +358,41 @@ To hand-tune one song, put a JSON file next to the music file with the same name
 | `singing` | Overrides for the show's `singing.moments` settings, e.g. `{"exposed_fraction": 0.4, "max_share": 0.3}` |
 | `effects` | Custom effects on `models` (model or group names) for a named `section` or a `start`/`end` range, on `layer` 0–2. `effect` is an engine preset (`Strobe_flash`, `Butterfly_gentle`, `Spirals_fast`, …) or any xLights effect name; `settings` override preset values. `every_beats` repeats it on every Nth beat from the bar line (`length_beats` long); omit both for one effect across the range. Generated effects on the same models and layer are cleared from that range |
 
+#### Design brief
+
+The settings file's `brief` gives a song its own look; the generator follows it within the
+show rules (safety and symmetry are unchanged):
+
+```json
+"brief": {
+  "mood": "warm, bouncy, 1960s TV special",
+  "motion": "punchy",
+  "effects": {"tree": ["Pinwheel_sweep", "Spirals_fast"], "custom": ["Butterfly_gentle"]},
+  "hero_effects": ["Pinwheel_sweep", "Chase_from_middle"],
+  "stems": {"other": ["SNOWFLAKES"], "bass": ["MEGA-TREES"]},
+  "arch_pattern": "bounce",
+  "signature_moment": {"name": "snowfall", "description": "meteors rain down both mega trees",
+                       "section": "climax", "models": ["MEGA-TREES"], "layer": 1, "effect": "Meteors_rain"}
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `mood` | Free text describing the concept (shown in the preview) |
+| `motion` | `punchy` (hardest accents) or `flowing` (motion phrases twice as long, half as many accents, soft morphs) |
+| `effects` | Motion presets per prop type (`arch`, `tree`, `single_line`, `poly_line`, `window`, `custom`, `other`), replacing the engine's choices |
+| `hero_effects` | Motion presets for hero props (each hero uses the ones in its prop type's family, or all of them if none fit); kept distinct from neighboring songs |
+| `stems` | `drums` / `bass` / `other` / `vocals` → models or groups. Their accent hits land on that stem's onsets (at most the usual density for the tier) wherever the stem is playing, in any non-breather section — and not where it's quiet |
+| `arch_pattern` | `chase`, `bounce`, `center_out` or `fill`; kept distinct from neighboring songs |
+| `signature_moment` | A custom effect (same fields as `effects` below) plus a `name` and `description`; all safety rules apply. `others` gives everyone else in its range a preset or look (or `"off"` for darkness) — such a moment owns its own props on every layer — and `stagger` (`center_out` / `left_to_right`, over `stagger_share` of it) starts its props one after another; symmetry pairs start together. No two songs may share a signature moment |
+| `secondary_moments` | More named moments (same fields), placed after the signature |
+| `concept`, `colors`, `differences` | The concept's name, its color direction, and "What makes this different" — specific contrasts with the other songs (shown in the preview) |
+| `looks` | Named looks: any xLights effect with settings by property id (see `docs/effect_inventory.md`), e.g. `{"embers": {"effect": "Candle", "settings": {"PerNode": true}}}`; usable anywhere the brief names an effect. Names, ranges and choices are checked against the installed xLights (`XLIGHTS_APP` overrides `/Applications/xLights.app`) |
+| `faces` | Whether the faces sing in this song (default no; with the rules' `singing.opt_in`, singers are otherwise ordinary props) |
+| `lyric_cues` | `{word, time, models, effect, layer, length_beats, stagger}`: an effect starting on a transcribed word. The word must be at that time (±0.15 s) in the vocal-stem transcription and pass the stem/mix cross-check, or generation fails |
+| `negative_space` | Props light only in peaks and where `fill_stem` rises above `fill_above` × its usual level, plus moments, cues and clicks |
+| `clicks` | `{stem, models, effect, length_seconds, min_gap_seconds}`: one short hit per onset of the stem (e.g. finger snaps), never while a face sings |
+
 #### Lyrics file
 
 Whisper often mishears sung lyrics. To fix the words, put the lyrics in a text file next
@@ -395,7 +430,11 @@ with an error. All fields are optional.
 | `notes` | The rules in plain words |
 | `priorities` | `hero` / `key` / `normal` / `optional` per model or group, always applied; overrides `set_model_priority` |
 | `symmetry` | `pairs` of `[left, right]` **models** (group names are rejected); `default` and `by_tier` modes: `mirror` (right side = left side flipped horizontally), `call_response` (motion and accents alternate sides bar by bar), `sync` (identical). A pair of singers mirrors only its background bed |
-| `arch_chase` | Arch models listed left to right with their arch `count` (and `reverse` if wired right to left); their motion becomes one arch per beat, starting on the bar line, in every non-breather section |
+| `arch_chase` | Arch models listed left to right with their arch `count` (and `reverse` if wired right to left); their motion becomes one step per beat, starting on the bar line, in every non-breather section, in the song's pattern from `patterns`: `chase` (one arch, left to right), `bounce` (left to right and back), `center_out` (the middle pair, then outward) or `fill` (one more arch per beat until all are lit) |
+| `avoid` | `effects` (e.g. `["Strobe"]`) and `plain_color_wash` (a Color Wash with no shimmer or fade) are errors in briefs and custom effects; the generator's own plain washes become `replace_plain_with` (a preset, or `"off"`: dark) |
+| `fast_flashing` | Once a prop's accent hits come closer than `min_gap_seconds` for `max_seconds`, the rest of that run keeps every other hit |
+| `calibration` | `max_hits_per_minute`: the generator's accent hits (all props together) are cut to this budget, keeping the final hit, peaks, hero props and downbeats first; a brief's moments, cues and clicks aren't counted |
+| `variety` | `adjacent_distinct`: what songs next to each other in show order (by track-number prefix) may not share — `hero_effects` and/or `arch_pattern`. A brief that breaks it is an error; songs without a brief get `hero_effects_per_song` hero effects and an arch pattern picked to avoid their neighbors. Hero effects are compared by xLights effect, so two looks of the same effect clash. `unique_signature_moments` forbids reusing another song's signature moment (same name, or the same effect on the same props); `faces_max_share` caps the share of songs whose faces sing (of the songs in the music folder). Each written song is recorded in the show design ledger, `xlights_mcp_design_ledger.json` (concept, hero effects, arch pattern, lyric cues, moments, faces) |
 | `floods` | One solid color per section, stepping through the palette's non-white colors — never motion or accents |
 | `twinkle` | Props that only twinkle in the given `tiers` (intro/outro count as breathers) |
 | `final_hit` | Props kept dark until the final hit, then held for `bars` and faded. The final hit is the per-song `final_hit`, else the last strong downbeat before the music goes silent — the downbeat grid is carried on to the end of the music, and a downbeat is strong when its attack and loudness are near the song's typical downbeat (a chord ringing into the fade isn't) — snapped to its onset; without downbeats, the strongest hit in the last 15 seconds of music. With `overrides_calm_bed` (default), a final hit inside a singing moment ends the calm bed there: the faces finish the phrase while every other prop (except floods) accents the hit and gets its regular effects back |

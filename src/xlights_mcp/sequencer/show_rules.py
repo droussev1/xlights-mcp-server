@@ -35,7 +35,7 @@ import json
 import logging
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from xlights_mcp.audio.analyzer import SongAnalysis
 from xlights_mcp.sequencer.song_settings import (
-    SongSettings, Tier, clip_out, expand_models,
+    ArchPattern, DesignBrief, SongSettings, Tier, clip_out, expand_models,
 )
 from xlights_mcp.xlights.models import ShowConfig
 from xlights_mcp.xlights.palettes import ColorPalette
@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 
 RULES_FILENAME = "xlights_mcp_rules.json"
 SIGNATURES_FILENAME = "xlights_mcp_signatures.json"
+DESIGNS_FILENAME = "xlights_mcp_design_ledger.json"  # the show design ledger
+ARCH_PATTERNS: tuple[str, ...] = ("chase", "bounce", "center_out", "fill")
 FLIP = {"B_CHOICE_BufferTransform": "Flip Horizontal"}
 QUIET_LABELS = ("intro", "outro", "transition")
 
@@ -85,6 +87,44 @@ class ArchModel(_Strict):
 
 class ArchChase(_Strict):
     arches: list[ArchModel] = Field(min_length=1)  # left to right
+    patterns: list[ArchPattern] = Field(default_factory=lambda: list(ARCH_PATTERNS))  # allowed per song
+
+
+class Avoid(_Strict):
+    """Looks the show doesn't use. Briefs and custom effects that ask for them are errors;
+    the generator's own plain washes are swapped for ``replace_plain_with``."""
+
+    effects: list[str] = Field(default_factory=list)  # xLights effect names, e.g. "Strobe"
+    plain_color_wash: bool = False  # a Color Wash without shimmer or a fade
+    replace_plain_with: str = "Twinkle_ambient"  # a preset, or "off" to leave the prop dark there
+
+
+class FastFlashing(_Strict):
+    """No long stretches of fast flashing: once a prop's hits come closer than
+    ``min_gap_seconds`` for ``max_seconds``, the rest of that run keeps every other hit."""
+
+    min_gap_seconds: float = Field(default=0.5, gt=0)
+    max_seconds: float = Field(default=8.0, gt=0)
+
+
+class Variety(_Strict):
+    """Songs next to each other in show order don't repeat each other's design; no song
+    reuses another's signature moment; faces sing in at most ``faces_max_share`` of songs."""
+
+    adjacent_distinct: list[Literal["hero_effects", "arch_pattern"]] = Field(
+        default_factory=lambda: ["hero_effects", "arch_pattern"])
+    hero_effects_per_song: int = Field(default=3, ge=1)  # picked when a song has no brief
+    unique_signature_moments: bool = True
+    faces_max_share: float = Field(default=0.34, ge=0, le=1)
+
+
+class Calibration(_Strict):
+    """The show's own busyness, measured from past sequences: the generator's accent hits
+    are kept under ``max_hits_per_minute`` (all props together), keeping the hits that
+    matter most — peaks, hero props, downbeats, the final hit — and dropping the rest.
+    Moments, lyric cues and clicks from a brief aren't counted."""
+
+    max_hits_per_minute: float = Field(gt=0)
 
 
 class Twinkle(_Strict):
@@ -127,6 +167,8 @@ class SingingMoments(_Strict):
 
 class Singing(_Strict):
     singers: list[str]
+    opt_in: bool = False  # faces sing only when the song's brief sets faces: true
+    not_singing: Priority = "normal"  # singers' priority in songs whose faces don't sing (opt_in)
     without_lyrics: dict[str, Priority] = Field(default_factory=dict)
     min_confidence: float = Field(default=0.5, ge=0, le=1)  # below this, the song has no faces
     moments: SingingMoments | None = None  # None: singers sing the whole song
@@ -240,6 +282,10 @@ class StyleRules(_Strict):
     priorities: dict[str, Priority] = Field(default_factory=dict)
     symmetry: Symmetry | None = None
     arch_chase: ArchChase | None = None
+    variety: Variety | None = None
+    avoid: Avoid | None = None
+    fast_flashing: FastFlashing | None = None
+    calibration: Calibration | None = None
     floods: list[str] = Field(default_factory=list)
     twinkle: Twinkle | None = None
     final_hit: FinalHit | None = None
@@ -413,7 +459,7 @@ def check_strobes(
     """Strobes may only run in the finale at the configured spacing (ValueError if not)."""
     if not (rules and rules.safety.strobes and song_settings):
         return
-    for e in song_settings.effects:
+    for e in song_settings.all_effects:
         if e.effect != "Strobe" and e.effect not in strobe_presets:
             continue
         start, end = song_settings.effect_range(e)
@@ -469,6 +515,7 @@ def apply_structure(
     priority_of: dict[str, str],
     final_hit: float | None,
     preset,  # variant key → (xLights effect name, settings)
+    arch_pattern: str | None = None,
 ) -> list[EffectPlacement]:
     """Floods, final-hit props, symmetry, twinkle props and the arch chase."""
     clock = _Clock(analysis, tiers)
@@ -533,13 +580,14 @@ def apply_structure(
                 effects = clip_out(effects, names, None, s.start_time_ms, s.end_time_ms)
                 effects += [_effect(n, 0, tw_name, s.start_time_ms, s.end_time_ms, tw_settings) for n in names]
 
-    # Arch chase: one arch per beat, left to right, starting on the bar line
+    # Arch chase: one step per beat in the song's pattern, starting on the bar line
     if rules.style.arch_chase:
         slots = [
             (a.model, a.count - 1 - i if a.reverse else i, a.count)
             for a in rules.style.arch_chase.arches for i in range(a.count)
         ]
         arch_names = {a.model for a in rules.style.arch_chase.arches}
+        steps = arch_steps(arch_pattern or "chase", len(slots))
         effects = [e for e in effects if not (e.model_name in arch_names and e.layer > 0)]
         beats = clock.beats
         first_bar = beats.index(clock.downbeats[0]) if clock.downbeats and clock.downbeats[0] in beats else 0
@@ -549,14 +597,283 @@ def apply_structure(
             for bi, b in enumerate(beats):
                 if not s.start_time <= b < s.end_time:
                     continue
-                model, arch, count = slots[(bi - first_bar) % len(slots)]
                 end = min(beats[bi + 1] if bi + 1 < len(beats) else s.end_time, s.end_time)
-                sub = f"{arch * 100 / count:.2f}x0.00x{(arch + 1) * 100 / count:.2f}x100.00"
-                effects.append(_effect(model, 1, on_name, int(b * 1000), int(end * 1000), {
-                    **on_settings, "B_CHOICE_BufferStyle": "Single Line", "B_CUSTOM_SubBuffer": sub,
-                }))
+                lit = steps[(bi - first_bar) % len(steps)]
+                for model, lo, hi, count in _arch_spans([slots[k] for k in lit]):
+                    sub = f"{lo * 100 / count:.2f}x0.00x{(hi + 1) * 100 / count:.2f}x100.00"
+                    effects.append(_effect(model, 1, on_name, int(b * 1000), int(end * 1000), {
+                        **on_settings, "B_CHOICE_BufferStyle": "Single Line", "B_CUSTOM_SubBuffer": sub,
+                    }))
 
     return effects
+
+
+def protected_models(rules: ShowRules, show_config: ShowConfig) -> set[str]:
+    """Models a brief's moments and cues can't take over: floods, final-hit props, excluded."""
+    names = [*rules.safety.exclude, *rules.style.floods,
+             *(rules.style.final_hit.models if rules.style.final_hit else [])]
+    return set(expand_models(names, show_config))
+
+
+def budget_hits(
+    effects: list[EffectPlacement], rules: ShowRules, analysis: SongAnalysis, tiers: list[str],
+    priority_of: dict[str, str], final_hit: float | None, featured: set[int] | None = None,
+) -> tuple[list[EffectPlacement], int]:
+    """Keep accent hits (layer 2) within the calibrated budget (see Calibration).
+
+    ``featured`` hits (ids; a brief's clicks) count like any others but are kept right
+    after the final hit; if even they don't fit, they're thinned evenly across the song.
+    """
+    cal = rules.style.calibration
+    hits = [e for e in effects if e.layer == 2]
+    budget = int(cal.max_hits_per_minute * analysis.duration_seconds / 60) if cal else len(hits)
+    if len(hits) <= budget:
+        return effects, 0
+    starts = [s.start_time_ms for s in analysis.sections]
+    downbeats = [int(d * 1000) for d in analysis.beats.downbeat_times]
+    hit_ms = int(final_hit * 1000) if final_hit is not None else None
+
+    def score(e: EffectPlacement) -> tuple:
+        i = max(bisect.bisect_right(starts, e.start_time_ms) - 1, 0)
+        j = bisect.bisect_left(downbeats, e.start_time_ms)
+        on_bar = any(abs(downbeats[k] - e.start_time_ms) <= 60 for k in (j - 1, j) if 0 <= k < len(downbeats))
+        return (hit_ms is not None and abs(e.start_time_ms - hit_ms) <= 60,
+                tiers[i] == "peak" if i < len(tiers) else False,
+                {"hero": 3, "key": 2, "normal": 1}.get(priority_of.get(e.model_name, "normal"), 0),
+                on_bar, -e.start_time_ms)
+    featured = featured or set()
+    ranked = sorted(hits, key=score, reverse=True)
+    top = [e for e in ranked if score(e)[0]]
+    feat = sorted((e for e in hits if id(e) in featured and not score(e)[0]), key=lambda e: e.start_time_ms)
+    rest = [e for e in ranked if id(e) not in featured and not score(e)[0]]
+    room = max(budget - len(top), 0)
+    if len(feat) > room:  # thin evenly rather than cutting the end off
+        feat = [feat[int(i * len(feat) / room)] for i in range(room)] if room else []
+    keep = {id(e) for e in [*top, *feat, *rest][:budget]}
+    return [e for e in effects if e.layer != 2 or id(e) in keep], len(hits) - len(keep)
+
+
+def is_plain_wash(effect_name: str, settings: dict[str, str]) -> bool:
+    """A Color Wash with no shimmer and no horizontal or vertical fade."""
+    return effect_name == "Color Wash" and not any(
+        settings.get(f"E_CHECKBOX_ColorWash_{k}") == "1" for k in ("Shimmer", "HFade", "VFade"))
+
+
+def check_avoided(rules: ShowRules | None, looks: list[tuple[str, str, dict[str, str]]]) -> None:
+    """ValueError if a brief look or custom effect (``(where, effect, settings)``) uses
+    something the show avoids."""
+    avoid = rules.style.avoid if rules else None
+    if not avoid:
+        return
+    for where, effect, settings in looks:
+        if effect in avoid.effects:
+            raise ValueError(f"{where} uses {effect}, which the show rules avoid")
+        if avoid.plain_color_wash and is_plain_wash(effect, settings):
+            raise ValueError(f"{where} is a plain color wash, which the show rules avoid; "
+                             "add shimmer or a fade (ColorWash_Shimmer, ColorWash_HFade or ColorWash_VFade)")
+
+
+def replace_plain_washes(effects: list[EffectPlacement], rules: ShowRules, preset) -> tuple[list[EffectPlacement], int]:
+    """Swap the generator's plain color washes for the rules' replacement look."""
+    avoid = rules.style.avoid
+    if not (avoid and avoid.plain_color_wash):
+        return effects, 0
+    dark = avoid.replace_plain_with == "off"
+    name, settings = (None, {}) if dark else preset(avoid.replace_plain_with)
+    out, n = [], 0
+    for e in effects:
+        if is_plain_wash(e.effect_name, e.settings):
+            n += 1
+            if dark:
+                continue
+            e = e.model_copy(update={"effect_name": name, "settings": dict(settings)})
+        out.append(e)
+    return out, n
+
+
+def limit_fast_flashing(effects: list[EffectPlacement], rules: ShowRules) -> tuple[list[EffectPlacement], int]:
+    """Thin accent hits that flash fast for too long (see FastFlashing)."""
+    cfg = rules.style.fast_flashing
+    if not cfg:
+        return effects, 0
+    gap_ms, run_ms = int(cfg.min_gap_seconds * 1000), int(cfg.max_seconds * 1000)
+    hits: dict[str, list[EffectPlacement]] = {}
+    for e in effects:
+        if e.layer == 2:
+            hits.setdefault(e.model_name, []).append(e)
+    drop: set[int] = set()
+    for model_hits in hits.values():
+        model_hits.sort(key=lambda e: e.start_time_ms)
+        prev, run_start, skip = None, 0, False
+        for e in model_hits:  # runs are measured on the original spacing
+            if prev is None or e.start_time_ms - prev.start_time_ms >= gap_ms:
+                run_start, skip = e.start_time_ms, False
+            elif e.start_time_ms - run_start >= run_ms:
+                skip = not skip
+                if skip:
+                    drop.add(id(e))
+            prev = e
+    return [e for e in effects if id(e) not in drop], len(drop)
+
+
+def arch_steps(pattern: str, n: int) -> list[list[int]]:
+    """The arches (0 = leftmost) lit on each beat of one cycle of an arch pattern.
+
+    chase: one arch at a time, left to right. bounce: left to right and back.
+    center_out: the middle pair, then outward a pair per beat. fill: one more arch per
+    beat, left to right, until all are lit, then start again.
+    """
+    if pattern == "chase":
+        return [[i] for i in range(n)]
+    if pattern == "bounce":
+        return [[i] for i in [*range(n), *range(n - 2, 0, -1)]] if n > 1 else [[0]]
+    if pattern == "center_out":
+        mid = n // 2
+        if n % 2:
+            return [[mid]] + [[mid - k, mid + k] for k in range(1, mid + 1)]
+        return [[mid - 1 - k, mid + k] for k in range(mid)]
+    if pattern == "fill":
+        return [list(range(k + 1)) for k in range(n)]
+    raise ValueError(f"Unknown arch pattern '{pattern}' (choose from {', '.join(ARCH_PATTERNS)})")
+
+
+def _arch_spans(lit: list[tuple[str, int, int]]) -> list[tuple[str, int, int, int]]:
+    """Lit (model, arch, count) slots → one (model, first, last, count) run per model,
+    since a model gets only one effect per layer at a time. Patterns light contiguous
+    arches on any one model."""
+    by_model: dict[str, list[int]] = {}
+    counts: dict[str, int] = {}
+    for model, arch, count in lit:
+        by_model.setdefault(model, []).append(arch)
+        counts[model] = count
+    return [(m, min(a), max(a), counts[m]) for m, a in by_model.items()]
+
+
+# ---------------------------------------------------------------------------
+# Design variety across the show
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Design:
+    hero_effects: list[str]
+    arch_pattern: str | None
+    signature_moment: str | None
+    neighbors: list[str]
+    concept: str = ""
+    signature: dict | None = None  # {"name", "effect", "models"} of the signature moment
+    secondary_moments: list[str] = field(default_factory=list)
+    lyric_cues: list[str] = field(default_factory=list)  # "word@time"
+    faces: bool = False
+    hero_families: list[str] = field(default_factory=list)
+
+
+def _read_designs(show_path: Path) -> dict[str, dict]:
+    try:
+        return json.loads((show_path / DESIGNS_FILENAME).read_text()).get("songs", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_design(show_path: Path, song: str, design: Design) -> None:
+    """Write this song's entry in the show design ledger."""
+    designs = _read_designs(show_path)
+    designs[song] = {"concept": design.concept, "hero_effects": design.hero_effects,
+                     "hero_families": design.hero_families,
+                     "arch_pattern": design.arch_pattern, "signature_moment": design.signature_moment,
+                     "signature": design.signature, "secondary_moments": design.secondary_moments,
+                     "lyric_cues": design.lyric_cues, "faces": design.faces}
+    (show_path / DESIGNS_FILENAME).write_text(json.dumps({"songs": designs}, indent=2) + "\n")
+
+
+def _signature_key(sig: dict | None, show_config: ShowConfig | None):
+    if not sig:
+        return None
+    models = sig.get("models", [])
+    if show_config is not None:
+        try:
+            models = expand_models(models, show_config)
+        except ValueError:
+            pass
+    return (sig.get("effect"), frozenset(models))
+
+
+def pick_design(
+    rules: ShowRules, show_path: Path, song: str, brief: DesignBrief | None, hero_pool: list[str],
+    show_size: int = 0, show_config: ShowConfig | None = None, family=None,
+) -> Design:
+    """This song's design for the ledger: hero effects and arch pattern, from its brief or
+    picked for it, checked against the rest of the show.
+
+    With the variety rule: songs either side of this one in show order (track-number
+    prefix) must not share its hero effects or arch pattern (a brief that does raises
+    ValueError, and picks avoid them); no song may reuse another's signature moment (same
+    name, or the same effect on the same props); and faces sing in at most
+    ``faces_max_share`` of the show's songs (``show_size``: the songs in its music folder,
+    or the ledger's songs if more). ``hero_pool`` is what a song without a brief picks
+    its hero effects from.
+    """
+    designs = _read_designs(show_path)
+    variety = rules.style.variety
+    distinct = set(variety.adjacent_distinct) if variety else set()
+    known = {**{s: [] for s in _read_registry(show_path)}, **designs}
+    neighbors = [s for s in adjacent_songs(song, known) if s in designs]
+    fam = family or (lambda k: k)  # effect key → its xLights effect (the family compared)
+    used_heroes = {f: s for s in neighbors
+                   for f in designs[s].get("hero_families") or designs[s].get("hero_effects", [])}
+    used_arches = {designs[s].get("arch_pattern"): s for s in neighbors}
+    allowed = list(rules.style.arch_chase.patterns) if rules.style.arch_chase else []
+    seed = int(hashlib.md5(song.encode()).hexdigest(), 16)
+
+    if brief and brief.hero_effects:
+        heroes = list(brief.hero_effects)
+        clash = next((k for k in heroes if fam(k) in used_heroes), None) if "hero_effects" in distinct else None
+        if clash:
+            raise ValueError(f"Hero effect '{clash}' ({fam(clash)}) is also a hero effect of "
+                             f"'{used_heroes[fam(clash)]}', next to this song in show order; "
+                             "pick different hero_effects in the brief")
+    else:
+        pool = [k for k in hero_pool if "hero_effects" not in distinct or fam(k) not in used_heroes] or hero_pool
+        n = variety.hero_effects_per_song if variety else 3
+        start = seed % len(pool) if pool else 0
+        heroes = (pool[start:] + pool[:start])[:n]
+
+    arch = None
+    if allowed:
+        if brief and brief.arch_pattern:
+            arch = brief.arch_pattern
+            if arch not in allowed:
+                raise ValueError(f"Arch pattern '{arch}' isn't allowed by the show rules ({', '.join(allowed)})")
+            if "arch_pattern" in distinct and arch in used_arches:
+                raise ValueError(f"Arch pattern '{arch}' is also used by '{used_arches[arch]}', "
+                                 "next to this song in show order; pick a different arch_pattern in the brief")
+        else:
+            options = [p for p in allowed if "arch_pattern" not in distinct or p not in used_arches] or allowed
+            arch = options[seed % len(options)]
+
+    moment = brief.signature_moment if brief else None
+    signature = {"name": moment.name, "effect": moment.effect, "models": moment.models} if moment else None
+    faces = bool(brief and brief.faces)
+    others = {s: d for s, d in designs.items() if s != song}
+    if variety and variety.unique_signature_moments and signature:
+        mine = _signature_key(signature, show_config)
+        for s, d in others.items():
+            theirs = d.get("signature")
+            if d.get("signature_moment") == signature["name"] or (theirs and _signature_key(theirs, show_config) == mine):
+                raise ValueError(f"Signature moment '{signature['name']}' repeats '{s}'s signature moment; "
+                                 "every song needs its own")
+    if variety and faces:
+        n_songs = max(show_size, len(others) + 1)
+        allowed_faces = max(1, int(variety.faces_max_share * n_songs))
+        singing = [s for s, d in others.items() if d.get("faces")]
+        if len(singing) + 1 > allowed_faces:
+            raise ValueError(f"Faces already sing in {len(singing)} of the show's songs ({', '.join(singing)}); "
+                             f"the rules allow about {variety.faces_max_share:.0%} ({allowed_faces} of {n_songs})")
+    return Design(heroes, arch, moment.name if moment else None, neighbors, hero_families=sorted({fam(k) for k in heroes}),
+                  concept=brief.concept if brief else "", signature=signature,
+                  secondary_moments=[m.name for m in brief.secondary_moments] if brief else [],
+                  lyric_cues=[f"{c.word}@{c.time:.2f}" for c in brief.lyric_cues] if brief else [],
+                  faces=faces)
 
 
 # ---------------------------------------------------------------------------

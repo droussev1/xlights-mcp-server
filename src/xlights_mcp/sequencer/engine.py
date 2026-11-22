@@ -648,6 +648,9 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
                          "spacing_beats": round(sorted(gaps)[len(gaps) // 2], 2) if gaps else None}
                         if strobes else None),
             "signature_colors": plan["signatures"],
+            "design": plan["design"],
+            "faces": plan["faces"],
+            "style_fixes": plan["style_fixes"],
             "accent_share": plan["share"],
             "full_white_moments": len(full_moments),
             "white_only_seconds": {k: round(v, 2) for k, v in white_only.items()},
@@ -666,7 +669,41 @@ def _summarize_plan(plan: dict, show_config: ShowConfig, rules: ShowRules | None
 # ---------------------------------------------------------------------------
 
 
-def _generate_auto(
+_ACTIVE_LOOKS: dict[str, tuple[str, dict[str, str]]] = {}  # the brief's looks while generating
+
+
+def _generate_auto(*args, **kwargs) -> dict:
+    """Auto generation with the song brief's looks usable as effect keys (see _generate_core)."""
+    song_settings = kwargs.get("song_settings") if "song_settings" in kwargs else (args[7] if len(args) > 7 else None)
+    looks = _resolve_looks(song_settings.brief if song_settings else None)
+    _ACTIVE_LOOKS.clear()
+    _ACTIVE_LOOKS.update(looks)
+    try:
+        return _generate_core(*args, **kwargs)
+    finally:
+        _ACTIVE_LOOKS.clear()
+
+
+def _resolve_looks(brief) -> dict[str, tuple[str, dict[str, str]]]:
+    """The brief's named looks as (xLights effect, xsq settings); ValueError if invalid."""
+    from xlights_mcp.xlights.effect_catalog import effect_settings
+    out = {}
+    for name, look in (brief.looks.items() if brief else []):
+        if name in EFFECT_VARIANTS:
+            raise ValueError(f"Brief look '{name}' has the same name as an engine preset; rename it")
+        try:
+            out[name] = (look.effect, effect_settings(look.effect, look.settings))
+        except ValueError as e:
+            raise ValueError(f"Brief look '{name}': {e}") from e
+    return out
+
+
+def is_effect_key(key: str) -> bool:
+    """An engine preset or one of the current brief's looks."""
+    return key in EFFECT_VARIANTS or key in _ACTIVE_LOOKS
+
+
+def _generate_core(
     analysis: SongAnalysis,
     show_config: ShowConfig,
     mp3_path: Path,
@@ -737,18 +774,76 @@ def _generate_auto(
     if show_rules and show_rules.style.priorities:  # show rules win over saved priorities
         priority_of.update(_resolve_model_priorities(show_rules.style.priorities, show_config))
 
+    # Design brief: motion style, effect families, stem → prop mapping, hero effects and
+    # arch pattern (the last two kept distinct from neighboring songs by the show rules)
+    brief = song_settings.brief if song_settings else None
+    if brief:
+        _validate_brief(brief)
+    if show_rules and song_settings:  # nothing the show avoids (strobes, plain washes...)
+        used = [(f"Brief look '{n}'", name, fx) for n, (name, fx) in _ACTIVE_LOOKS.items()]
+        for k in [*(k for keys in (brief.effects.values() if brief else []) for k in keys),
+                  *(brief.hero_effects if brief else [])]:
+            used.append((f"Brief effect '{k}'", _effect_name_from_key(k), _get_settings(k)))
+        for c in song_settings.all_effects:
+            name, fx = ((_effect_name_from_key(c.effect), {**_get_settings(c.effect), **c.settings})
+                        if is_effect_key(c.effect) else (c.effect, dict(c.settings)))
+            label = getattr(c, "name", None)
+            used.append((f"Signature moment '{label}'" if label else f"Custom effect '{c.effect}'", name, fx))
+        show_rules_mod.check_avoided(show_rules, used)
+    stem_of: dict[str, str] = {}
+    for stem, names in (brief.stems.items() if brief else []):
+        for name in song_settings_mod.expand_models(names, show_config):
+            stem_of[name] = stem
+    design = None
+    if show_rules:
+        hero_cats = sorted({m.model_category for m in generic_models if priority_of.get(m.name) == "hero"})
+        hero_pool = list(dict.fromkeys(k for c in hero_cats for k in MOTION_EFFECTS.get(c, MOTION_EFFECTS["other"])))
+        audio = [f for f in mp3_path.parent.glob("*") if f.suffix.lower() in AUDIO_SUFFIXES] if mp3_path.parent.is_dir() else []
+        design = show_rules_mod.pick_design(show_rules, Path(show_config.show_path), mp3_path.stem, brief, hero_pool,
+                                            show_size=len({f.stem for f in audio}), show_config=show_config,
+                                            family=_effect_name_from_key)
+    hero_effects = design.hero_effects if design else (brief.hero_effects if brief else [])
+    flowing = bool(brief and brief.motion == "flowing")
+    # Negative space: which sections fill (peaks, and swells of the brief's fill stem)
+    fill_ok: list[bool] = []
+    if brief and brief.negative_space:
+        ns, sa = brief.negative_space, analysis.stem_analysis
+        swell = [False] * len(analysis.sections)
+        if ns.fill_stem and sa.available and ns.fill_stem in sa.stems:
+            levels = [sa.get_level_in_range(ns.fill_stem, x.start_time, x.end_time) for x in analysis.sections]
+            typical = sorted(levels)[len(levels) // 2] if levels else 0.0
+            swell = [lv >= ns.fill_above * typical > 0 for lv in levels]
+        fill_ok = [t == "peak" or sw for t, sw in zip(section_tiers, swell)]
+    # A stem is "playing" in a section when its level there is a fair share of its usual level
+    stem_levels: dict[str, float] = {}
+    click_stems = {c.stem for c in brief.clicks} if brief else set()
+    if (stem_of or click_stems) and analysis.stem_analysis.available:
+        for stem in set(stem_of.values()) | click_stems:
+            if stem in analysis.stem_analysis.stems:
+                levels = sorted(analysis.stem_analysis.get_level_in_range(stem, s.start_time, s.end_time)
+                                for s in analysis.sections)
+                stem_levels[stem] = levels[len(levels) // 2] if levels else 0.0
+
     # Identify singing models — the rules' singers, else normal-priority face models
-    singers = set(show_rules.style.singing.singers) if show_rules and show_rules.style.singing else None
+    singing_cfg = show_rules.style.singing if show_rules else None
+    singers = set(singing_cfg.singers) if singing_cfg else None
     singing_models: dict[str, str] = {}  # model_name → face_definition_name
     for m in generic_models:
         if m.face_definitions and (
             m.name in singers if singers is not None else priority_of.get(m.name, "normal") == "normal"
         ):
             singing_models[m.name] = m.face_definitions[0]
+    # Faces are a creative choice: with opt_in they sing only if the brief asks; otherwise
+    # the singers are ordinary secondary props
+    if singing_cfg and singing_cfg.opt_in and not (brief and brief.faces) and singing_models:
+        priority_of.update({n: singing_cfg.not_singing for n in singing_models})
+        singing_models = {}
 
     # Singers default to the vocal-stem track. Without usable lyrics — none found, or a
     # low-confidence transcription — they run regular effects with the rules' fallbacks.
-    vocal_tracks = _try_extract_vocal_tracks(mp3_path) if singing_models else []
+    cue_words = bool(brief and brief.lyric_cues)
+    all_tracks = _try_extract_vocal_tracks(mp3_path) if (singing_models or cue_words) else []
+    vocal_tracks = all_tracks if singing_models else []
     min_conf = show_rules.style.singing.min_confidence if show_rules and show_rules.style.singing \
         else DEFAULT_MIN_LYRIC_CONFIDENCE
     lyrics_status = "no singers" if not singing_models else "no lyrics found"
@@ -788,17 +883,18 @@ def _generate_auto(
     if singing_models:
         logger.info(f"Singing models excluded from regular pipeline: {list(singing_models.keys())}")
 
-    # Members with different priorities can't share one effect plan — split them
+    # Members with different priorities or stems can't share one effect plan — split them
     for group_name in list(groups):
-        by_priority: dict[str, list[LightModel]] = {}
+        by_role: dict[tuple[str, str | None], list[LightModel]] = {}
         for m in groups[group_name]:
-            by_priority.setdefault(priority_of.get(m.name, "normal"), []).append(m)
-        if len(by_priority) > 1:
+            by_role.setdefault((priority_of.get(m.name, "normal"), stem_of.get(m.name)), []).append(m)
+        if len(by_role) > 1:
             cat = group_categories.pop(group_name)
             del groups[group_name]
-            for p, members in by_priority.items():
-                groups[f"{group_name} ({p})"] = members
-                group_categories[f"{group_name} ({p})"] = cat
+            for (p, stem), members in by_role.items():
+                label = f"{group_name} ({p}{', ' + stem if stem else ''})"
+                groups[label] = members
+                group_categories[label] = cat
 
     # Track last motion effect key to avoid consecutive repeats
     last_motion_key_per_group: dict[str, str] = {}
@@ -808,6 +904,14 @@ def _generate_auto(
         group_rng = random.Random(_stable_hash(group_seed + mp3_path.stem))
         stem_data: StemAnalysis = analysis.stem_analysis
         priority = priority_of.get(model_names[0], "normal")  # groups are split by priority
+        mapped_stem = stem_of.get(model_names[0])  # ...and by stem
+        if mapped_stem and not (stem_data.available and mapped_stem in stem_data.stems):
+            mapped_stem = None
+        brief_motion = brief.effects.get(cat) if brief else None
+        hero_motion = [k for k in hero_effects
+                       if k in MOTION_EFFECTS.get(cat, MOTION_EFFECTS["other"]) or k in (brief_motion or [])]
+        if priority == "hero" and brief and brief.hero_effects and not hero_motion:
+            hero_motion = list(brief.hero_effects)  # the brief's word goes for heroes
 
         for sec_idx, section in enumerate(analysis.sections):
             is_peak = section_tiers[sec_idx] == "peak"
@@ -819,6 +923,10 @@ def _generate_auto(
             palette = palette_pool[pal_idx]
 
             downbeats_in_section = section_downbeats.get(sec_idx, [])
+            # Negative space: outside the fills, only stem-mapped props light (as accents)
+            dark = bool(fill_ok) and not fill_ok[sec_idx]
+            if dark and not mapped_stem:
+                continue
 
             # Determine section type config
             sec_config = SECTION_TYPE_CONFIG.get(section.label, SECTION_TYPE_CONFIG["unknown"])
@@ -846,7 +954,7 @@ def _generate_auto(
                 bed_key = group_rng.choice(bed_choices)
 
             bed_settings = _get_settings(bed_key)
-            for name in model_names:
+            for name in ([] if dark else model_names):
                 all_effects.append(EffectPlacement(
                     model_name=name, layer=0,
                     effect_name=_effect_name_from_key(bed_key),
@@ -856,10 +964,15 @@ def _generate_auto(
                 ))
 
             # --- LAYER 1: Motion (stem-reactive, section-varied) ---
-            if use_motion:
+            use_accents = use_accents and not dark
+            if use_motion and not dark:
                 # Pick motion choices based on stem dominance and section type
                 motion_override = sec_config.get("motion_override", {}).get(cat)
-                if motion_override:
+                if priority == "hero" and hero_motion:
+                    motion_choices = hero_motion
+                elif brief_motion:
+                    motion_choices = brief_motion
+                elif motion_override:
                     motion_choices = motion_override
                 elif stem_data.available and dom_stem in STEM_MOTION_OVERRIDES:
                     stem_motions = STEM_MOTION_OVERRIDES[dom_stem].get(cat)
@@ -878,6 +991,8 @@ def _generate_auto(
                     bars_per_variant = 2 if is_peak else 4
                     if priority == "hero":
                         bars_per_variant //= 2
+                    if flowing:  # longer phrases of motion
+                        bars_per_variant *= 2
                     variant_idx = 0
                     for j in range(len(downbeats_in_section) - 1):
                         if j > 0 and j % bars_per_variant == 0:
@@ -912,31 +1027,51 @@ def _generate_auto(
                     last_motion_key_per_group[group_seed] = motion_key
 
             # --- LAYER 2: Accent hits (stem-reactive timing) ---
-            if use_accents:
+            # Props mapped to a stem by the brief accent its onsets wherever it plays
+            stem_active = bool(mapped_stem) and not is_breather and section.label not in _UNRANKED_LABELS \
+                and stem_data.get_level_in_range(mapped_stem, section.start_time, section.end_time) \
+                >= STEM_ACTIVE_FRACTION * stem_levels.get(mapped_stem, 0.0)
+            if use_accents or stem_active:
                 # Choose accent effects based on dominant stem (vocal-led sections have no
                 # stem preference and use the category's accents)
-                accent_choices = STEM_ACCENT_OVERRIDES.get(dom_stem) or ACCENT_EFFECTS.get(cat, ACCENT_EFFECTS["other"])
+                accent_choices = (STEM_ACCENT_OVERRIDES.get(mapped_stem or dom_stem)
+                                  or ACCENT_EFFECTS.get(cat, ACCENT_EFFECTS["other"]))
+                if flowing:  # soft morphs, never punches
+                    accent_choices = ["Morph_quick"]
+                elif brief and "Shockwave_hit" in accent_choices:  # punchy: the hardest hit on offer
+                    accent_choices = ["Shockwave_hit"]
 
                 accent_key = group_rng.choice(accent_choices)
                 accent_settings = _get_settings(accent_key)
 
                 # Every beat in peaks, every other beat for heroes, once per bar otherwise
+                # (half as often when the brief's motion is flowing)
                 if is_peak:
                     beat_step = 1
                 elif priority == "hero":
                     beat_step = 2
                 else:
                     beat_step = 4
+                if flowing:
+                    beat_step *= 2
 
-                if beat_step == 4:
-                    accent_times = downbeats_in_section
+                if mapped_stem and stem_active:
+                    gap = beat_step * 60 / max(analysis.beats.tempo, 1) * 0.9
+                    accent_times = []
+                    for t in stem_data.get_onsets_in_range(mapped_stem, section.start_time, section.end_time):
+                        if not accent_times or t - accent_times[-1] >= gap:
+                            accent_times.append(t)
+                elif mapped_stem:
+                    accent_times = []  # its stem is quiet here
+                elif beat_step >= 4:
+                    accent_times = downbeats_in_section[::beat_step // 4]
                 else:
                     beats_here = section_beats.get(sec_idx, [])
                     # Keep every-other-beat hits on beats 1 and 3 of the bar
                     if beat_step == 2 and downbeats_in_section and downbeats_in_section[0] in beats_here:
                         beats_here = beats_here[beats_here.index(downbeats_in_section[0]) % 2:]
                     accent_times = beats_here[::beat_step]
-                if stem_data.available and "drums" in stem_data.stems:
+                if not mapped_stem and stem_data.available and "drums" in stem_data.stems:
                     accent_times = _snap_to_onsets(accent_times, stem_data.get_onsets_in_range(
                         "drums", section.start_time - DRUM_SNAP_SECONDS, section.end_time
                     ))
@@ -1122,6 +1257,7 @@ def _generate_auto(
 
     signatures: list[str] = []
     share = finale = final_hit = None
+    hits_dropped = clicks_placed = 0
     singing_moments: list = []
     trimmed_phrases: list = []
     disputed_passages: list = []
@@ -1132,6 +1268,7 @@ def _generate_auto(
         all_effects = show_rules_mod.apply_structure(
             show_rules, all_effects, analysis, section_tiers, show_config, priority_of, final_hit,
             preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
+            arch_pattern=design.arch_pattern if design else None,
         )
         # Style: faces sing only in vocal feature moments; other props calm down meanwhile
         if moments_cfg and has_lyrics and singing_models:
@@ -1153,16 +1290,49 @@ def _generate_auto(
                 show_rules, preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
                 final_hit=final_hit, beat_seconds=60 / max(analysis.beats.tempo, 1), hit_effect=hit_effect,
             )
+        # Brief: clicks on the click stem's onsets (counted in the budget below)
+        if brief and brief.clicks:
+            cal = show_rules.style.calibration
+            room = None
+            if cal:  # the budget, less the final-hit accents that always stay
+                at_hit = sum(1 for e in all_effects if e.layer == 2 and final_hit is not None
+                             and abs(e.start_time_ms - final_hit * 1000) <= 60)
+                room = max(int(cal.max_hits_per_minute * analysis.duration_seconds / 60) - at_hit, 0)
+            all_effects, clicks_placed, click_ids = _place_clicks(
+                brief, all_effects, analysis, show_config, section_tiers, stem_levels, singing_moments,
+                show_rules_mod.protected_models(show_rules, show_config) | set(singing_models),
+                pairs=[tuple(x) for x in show_rules.style.symmetry.pairs] if show_rules.style.symmetry else [],
+                max_clicks=room)
+        # Style: keep accent hits (and clicks) within the show's calibrated budget
+        clicks = click_ids if brief and brief.clicks else set()
+        all_effects, hits_dropped = show_rules_mod.budget_hits(
+            all_effects, show_rules, analysis, section_tiers, priority_of, final_hit, featured=clicks)
         # Safety: strobes only in the finale, at the required spacing
         strobe_presets = {k for k in EFFECT_VARIANTS if _effect_name_from_key(k) == "Strobe"}
         show_rules_mod.check_strobes(show_rules, song_settings, finale, strobe_presets)
 
-    if song_settings and song_settings.effects:
+    protected = show_rules_mod.protected_models(show_rules, show_config) if show_rules else set()
+    singing_windows = {n: [(int(m.start * 1000), int(m.end * 1000)) for m in singing_moments]
+                       for n in singing_models}
+    if brief and brief.clicks and not show_rules:
+        all_effects, clicks_placed, _ = _place_clicks(brief, all_effects, analysis, show_config, section_tiers,
+                                                      stem_levels, singing_moments, set(singing_models))
+    cue_effects = _resolve_cues(brief, all_tracks, analysis) if cue_words else []
+    if song_settings and (song_settings.all_effects or cue_effects):
         all_effects = song_settings_mod.apply_custom_effects(
-            song_settings, all_effects, analysis, show_config, palette_pool,
+            song_settings, all_effects, analysis, show_config, palette_pool, extra=cue_effects,
+            protected=protected, busy=singing_windows,
+            pairs=[tuple(x) for x in show_rules.style.symmetry.pairs] if show_rules and show_rules.style.symmetry else None,
         )
 
+    style_fixes = {"plain_washes_replaced": 0, "fast_flash_hits_thinned": 0}
     if show_rules:
+        # Style: the show's avoided looks and its limit on fast flashing
+        preset = lambda key: (_effect_name_from_key(key), _get_settings(key))  # noqa: E731
+        all_effects, style_fixes["plain_washes_replaced"] = show_rules_mod.replace_plain_washes(
+            all_effects, show_rules, preset)
+        all_effects, style_fixes["fast_flash_hits_thinned"] = show_rules_mod.limit_fast_flashing(
+            all_effects, show_rules)
         # Safety: excluded models never get effects
         excluded = show_rules_mod.excluded_models(show_rules, show_config)
         all_effects = [e for e in all_effects if e.model_name not in excluded]
@@ -1197,6 +1367,9 @@ def _generate_auto(
         return {
             "spec": spec, "plan_id": plan_id, "analysis": analysis, "tiers": section_tiers,
             "finale": finale, "final_hit": final_hit, "signatures": signatures, "share": share,
+            "design": _design_summary(brief, design, stem_of, song_settings, cue_effects), "style_fixes": {
+                **style_fixes, "hits_over_budget_dropped": hits_dropped, "clicks": clicks_placed},
+            "faces": bool(singing_models),
             "lyrics": lyrics_status, "priority_of": priority_of, "singing_moments": singing_moments,
             "trimmed_phrases": trimmed_phrases, "disputed_passages": disputed_passages,
             "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
@@ -1214,6 +1387,8 @@ def _generate_auto(
     write_xsq(spec, show_config, output_path)
     if signatures:
         show_rules_mod.record_signatures(Path(show_config.show_path), mp3_path.stem, signatures)
+    if design:
+        show_rules_mod.record_design(Path(show_config.show_path), mp3_path.stem, design)
 
     layers_used = set(e.layer for e in all_effects)
 
@@ -1236,6 +1411,7 @@ def _generate_auto(
         "lyrics": lyrics_status,
         "singing_moments": _moments_summary(singing_moments, analysis, trimmed_phrases, disputed_passages),
         "signature_colors": signatures,
+        "design": _design_summary(brief, design, stem_of, song_settings, cue_effects),
         "accent_share": share,
         "plan_id": plan_id,
         "message": f"Sequence created: {output_path.name}. Open in xLights to preview and render.",
@@ -1293,7 +1469,9 @@ def _generate_guided_preview(
 
 
 def _get_settings(variant_key: str) -> dict[str, str]:
-    """Get effect settings for a named variant."""
+    """Get effect settings for a named variant (or the current brief's look)."""
+    if variant_key in _ACTIVE_LOOKS:
+        return dict(_ACTIVE_LOOKS[variant_key][1])
     variants = EFFECT_VARIANTS.get(variant_key, [{}])
     return variants[0].copy() if variants else {}
 
@@ -1303,6 +1481,8 @@ def _effect_name_from_key(variant_key: str) -> str:
 
     e.g. 'Chase_left' → 'SingleStrand', 'Shockwave_hit' → 'Shockwave'
     """
+    if variant_key in _ACTIVE_LOOKS:
+        return _ACTIVE_LOOKS[variant_key][0]
     key_to_effect = {
         "Shockwave_hit": "Shockwave",
         "Chase_left": "SingleStrand",
@@ -1330,6 +1510,39 @@ def _effect_name_from_key(variant_key: str) -> str:
         "On_solid": "On",
     }
     return key_to_effect.get(variant_key, variant_key.split("_")[0])
+
+
+def _design_summary(brief, design, stem_of: dict[str, str], song_settings, cues=()) -> dict | None:
+    if not (brief or design):
+        return None
+    out: dict = {}
+    if brief:
+        out.update({"concept": brief.concept, "mood": brief.mood, "colors": brief.colors,
+                    "motion": brief.motion, "faces": brief.faces, "effects": brief.effects,
+                    "looks": {k: v.effect for k, v in brief.looks.items()},
+                    "negative_space": brief.negative_space.model_dump() if brief.negative_space else None,
+                    "clicks": [c.model_dump() for c in brief.clicks],
+                    "lyric_cues": [{"word": c.word, "at": f"{e.start:.2f}s", "until": f"{e.end:.2f}s",
+                                    "models": c.models, "effect": c.effect}
+                                   for c, e in zip(brief.lyric_cues, cues)],
+                    "secondary_moments": [{"name": m.name, "range": [f"{a:.2f}s" for a in song_settings.effect_range(m)],
+                                           "effect": m.effect, "others": m.others}
+                                          for m in brief.secondary_moments],
+                    "differences": brief.differences})
+        stems: dict[str, list[str]] = {}
+        for name, stem in sorted(stem_of.items()):
+            stems.setdefault(stem, []).append(name)
+        out["stems"] = stems
+    if design:
+        out.update({"hero_effects": design.hero_effects, "arch_pattern": design.arch_pattern,
+                    "neighbors": design.neighbors})
+    moment = brief.signature_moment if brief else None
+    if moment:
+        start, end = song_settings.effect_range(moment)
+        out["signature_moment"] = {"name": moment.name, "description": moment.description,
+                                   "start": f"{start:.2f}s", "end": f"{end:.2f}s",
+                                   "models": moment.models, "effect": moment.effect}
+    return out
 
 
 def _moments_summary(
@@ -1371,6 +1584,139 @@ def _stable_hash(text: str) -> int:
 
 
 DRUM_SNAP_SECONDS = 0.06
+AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"}
+CUE_SNAP_SECONDS = 0.15  # a cue's time must be this close to its word's transcribed start
+
+
+def _resolve_cues(brief, tracks, analysis: SongAnalysis) -> list:
+    """The brief's lyric cues as custom effects starting on their words. ValueError if a
+    cue's word isn't in the vocal-stem transcription at that time, or if the stem and mix
+    transcriptions disagree on it (it failed the cross-check)."""
+    stem = next((t for t in tracks if t.source == "vocals_stem"), None)
+    mix = next((t for t in tracks if t.source == "full_mix"), None)
+    if stem is None:
+        raise ValueError("Lyric cues need the vocal-stem transcription, and none is available for this song")
+    bad = show_rules_mod.cross_check(stem.words, mix.words)[0] if mix else set()
+    beat = 60 / max(analysis.beats.tempo, 1)
+    norm = show_rules_mod._norm_word
+    out = []
+    for cue in brief.lyric_cues:
+        first = norm(cue.word.split()[0])
+        hits = [(i, w) for i, w in enumerate(stem.words)
+                if norm(w.word) == first and abs(w.start_time - cue.time) <= CUE_SNAP_SECONDS]
+        if not hits:
+            near = min(stem.words, key=lambda w: abs(w.start_time - cue.time))
+            raise ValueError(f"Lyric cue '{cue.word}' at {cue.time:.2f}s: the transcription has "
+                             f"'{near.word}' at {near.start_time:.2f}s there")
+        i, w = hits[0]
+        if i in bad:
+            raise ValueError(f"Lyric cue '{cue.word}' at {cue.time:.2f}s failed the cross-check "
+                             "(the stem and mix transcriptions disagree there)")
+        n = len(cue.word.split())
+        end_word = stem.words[min(i + n - 1, len(stem.words) - 1)]
+        end = w.start_time + cue.length_beats * beat if cue.length_beats else end_word.end_time
+        out.append(song_settings_mod.SignatureMoment(
+            name=f"cue {cue.word}", models=cue.models, effect=cue.effect, layer=cue.layer,
+            start=w.start_time, end=max(end, w.start_time + 0.1), settings=cue.settings, stagger=cue.stagger))
+    return out
+
+
+def _even(items: list, n: int) -> list:
+    """``n`` of ``items``, spread evenly."""
+    return [items[int(i * len(items) / n)] for i in range(n)] if n else []
+
+
+def _travel_order(names: list[str], show_config: ShowConfig, pairs) -> list[tuple[str | None, str | None]]:
+    """Left/right pairs among ``names`` from the middle of the layout outward (unpaired
+    props stand alone), for a click that travels across the yard."""
+    xs = {m.name: m.x for m in show_config.models}
+    known = [x for x in xs.values() if x is not None]
+    mid = (min(known) + max(known)) / 2 if known else 0.0
+    left_right = [(a, b) for a, b in pairs if a in names and b in names]
+    paired = {n for ab in left_right for n in ab}
+    units = [*left_right, *((n, None) for n in names if n not in paired)]
+    def dist(u):
+        xs_u = [xs.get(n) for n in u if n and xs.get(n) is not None]
+        return min(abs(x - mid) for x in xs_u) if xs_u else 0.0
+    return sorted(units, key=dist)
+
+
+def _place_clicks(brief, effects, analysis, show_config, tiers, stem_levels, moments, protected, pairs=(),
+                  max_clicks=None):
+    """One short hit per onset of the click stem, wherever it plays, never while a face
+    sings. Over ``max_clicks`` hits, snaps are thinned evenly first, so a travelling
+    click keeps its path and its left/right balance. Returns the effects, the number of
+    clicks, and the clicks' ids (for the hit budget)."""
+    sa = analysis.stem_analysis
+    placed = 0
+    downbeats = analysis.beats.downbeat_times
+    made: set[int] = set()
+    for spec in brief.clicks:
+        if not (sa.available and spec.stem in sa.stems):
+            continue
+        names = [n for n in song_settings_mod.expand_models(spec.models, show_config) if n not in protected]
+        name, fx = _effect_name_from_key(spec.effect), _get_settings(spec.effect)
+        typical = stem_levels.get(spec.stem, 0.0)
+        times: list[float] = []
+        for sec, tier in zip(analysis.sections, tiers):
+            if sa.get_level_in_range(spec.stem, sec.start_time, sec.end_time) < STEM_ACTIVE_FRACTION * typical:
+                continue
+            for t in sa.get_onsets_in_range(spec.stem, sec.start_time, sec.end_time):
+                if any(m.start <= t < m.end for m in moments):
+                    continue
+                if not times or t - times[-1] >= spec.min_gap_seconds:
+                    times.append(t)
+        per_snap = 1 if spec.mode == "travel" else max(len(names), 1)
+        if max_clicks is not None and len(times) * per_snap > max_clicks:
+            # Thin whole bars evenly, so the bars that stay keep their left/right pairs
+            bars: dict[int, list[float]] = {}
+            for t in times:
+                bars.setdefault(bisect.bisect_right(downbeats, t), []).append(t)
+            groups = list(bars.values())
+            keep_n = len(groups)
+            while keep_n and sum(len(g) for g in _even(groups, keep_n)) * per_snap > max_clicks:
+                keep_n -= 1
+            times = [t for g in _even(groups, keep_n) for t in g]
+        order = _travel_order(names, show_config, pairs) if spec.mode == "travel" else []
+        path = [*range(len(order)), *range(len(order) - 2, 0, -1)] or [0]  # out and back
+        step, side = -1, 0
+        for t in times:
+            lo = int(t * 1000)
+            hi = lo + round(spec.length_seconds * 1000)
+            if spec.mode == "travel" and order:
+                # Left, right, left, right...: every bar is balanced to within one click
+                if side == 0:  # a new left-side click moves the travel one step on
+                    step += 1
+                left, right = order[path[step % len(path)]]
+                who = [left] if side == 0 or right is None else [right]
+                side = 1 - side if right is not None else 0
+            else:
+                who = names
+            effects = song_settings_mod.clip_out(effects, who, 2, lo, hi)
+            new = [EffectPlacement(model_name=n, layer=2, effect_name=name, start_time_ms=lo,
+                                   end_time_ms=hi, settings=dict(fx)) for n in who]
+            made.update(id(e) for e in new)
+            effects += new
+            placed += len(who)
+    return effects, placed, made
+STEM_ACTIVE_FRACTION = 0.25  # a mapped stem below this share of its median section level is quiet
+
+
+def _validate_brief(brief) -> None:
+    """Raise ValueError for brief entries the engine can't follow."""
+    for cat, keys in brief.effects.items():
+        if cat not in MOTION_EFFECTS:
+            raise ValueError(f"Brief effects: unknown prop type '{cat}' (choose from {', '.join(MOTION_EFFECTS)})")
+        _check_presets(keys, f"effects.{cat}")
+    _check_presets(brief.hero_effects, "hero_effects")
+
+
+def _check_presets(keys: list[str], where: str) -> None:
+    for k in keys:
+        if not is_effect_key(k):
+            raise ValueError(f"Brief {where}: unknown effect preset or look '{k}'")
+        if _effect_name_from_key(k) == "Strobe":
+            raise ValueError(f"Brief {where}: strobes belong in the finale as a custom effect, not in motion")
 DEFAULT_MIN_LYRIC_CONFIDENCE = 0.5
 
 
