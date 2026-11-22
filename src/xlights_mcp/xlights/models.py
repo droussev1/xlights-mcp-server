@@ -37,6 +37,7 @@ class LightModel(BaseModel):
     string_type: str = "RGB Nodes"
     submodels: list[SubModel] = Field(default_factory=list)
     face_definitions: list[str] = Field(default_factory=list)  # e.g. ["Standing Snowman Singing Face"]
+    x: float | None = None  # layout position (WorldPosX): smaller is further to the audience's left
 
     @property
     def model_category(self) -> str:

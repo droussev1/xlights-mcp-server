@@ -157,11 +157,19 @@ def load_show_models(show_path: Path) -> list[LightModel]:
                 string_type=m.get("StringType", "RGB Nodes"),
                 submodels=submodels,
                 face_definitions=face_definitions,
+                x=_float(m.get("WorldPosX")),
             )
             models.append(model)
 
     logger.info(f"Loaded {len(models)} models from {effects_file}")
     return models
+
+
+def _float(value: str | None) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 def load_model_groups(show_path: Path) -> list[ModelGroup]:
