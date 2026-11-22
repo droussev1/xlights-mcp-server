@@ -114,7 +114,6 @@ class SingingMoments(_Strict):
     max_phrase_bars: float = Field(default=8.0, gt=0)  # longer phrases split at their longest pauses
     phrase_gap_seconds: float = Field(default=0.75, gt=0)  # a longer silence ends a phrase
     cross_check: bool = True  # no singing where the vocal-stem and full-mix transcriptions disagree
-    max_cross_check_offset_seconds: float = Field(default=0.35, ge=0)  # same word, start times this close
     merge_gap_bars: float = Field(default=1.0, ge=0)  # phrases closer than this sing as one moment
     avoid_tiers: list[Tier] = Field(default_factory=lambda: ["peak"])
     peak_lead_bars: float = Field(default=1.0, ge=0)  # moments end at least this long before a peak
@@ -630,14 +629,15 @@ def _norm_word(word: str) -> str:
     return "".join(ch for ch in word.lower() if ch.isalnum())
 
 
-def cross_check(words, reference, max_offset: float) -> tuple[set[int], set[int], list[DisputedPassage]]:
+def cross_check(words, reference) -> tuple[set[int], set[int], list[DisputedPassage]]:
     """Where the vocal-stem transcription (``words``) and the full-mix one (``reference``)
-    disagree.
+    disagree on the words.
 
     The two are aligned word by word. Stem words the mix heard differently or not at all
-    (a different word count), or heard more than ``max_offset`` seconds apart, are
-    disputed; words only the mix heard break the stem phrase where they fall. Returns the
-    disputed stem word indices, the indices a phrase must break before, and the passages.
+    (a different word count) are disputed; words only the mix heard break the stem phrase
+    where they fall. Words both heard are kept with the stem's timing, however far apart
+    the two placed them. Returns the disputed stem word indices, the indices a phrase must
+    break before, and the passages.
     """
     matcher = difflib.SequenceMatcher(None, [_norm_word(w.word) for w in words],
                                       [_norm_word(w.word) for w in reference], autojunk=False)
@@ -652,18 +652,7 @@ def cross_check(words, reference, max_offset: float) -> tuple[set[int], set[int]
                                         " ".join(w.word for w in ours), " ".join(w.word for w in theirs)))
 
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        if op == "equal":  # same words: they must also be heard at the same time
-            runs: list[list[int]] = []
-            for i, j in zip(range(i1, i2), range(j1, j2)):
-                if abs(words[i].start_time - reference[j].start_time) > max_offset:
-                    disputed.add(i)
-                    if runs and runs[-1][1] == i:
-                        runs[-1][1], runs[-1][3] = i + 1, j + 1
-                    else:
-                        runs.append([i, i + 1, j, j + 1])
-            for run in runs:
-                passage(*run)
-        elif op in ("replace", "delete"):
+        if op in ("replace", "delete"):
             disputed.update(range(i1, i2))
             passage(i1, i2, j1, j2)
         elif op == "insert":
@@ -705,7 +694,7 @@ def pick_singing_moments(
     bad: set[int] = set()
     breaks: set[int] = set()
     if cfg.cross_check and reference_words:
-        bad, breaks, passages = cross_check(words, reference_words, cfg.max_cross_check_offset_seconds)
+        bad, breaks, passages = cross_check(words, reference_words)
         if disputed is not None:
             disputed.extend(passages)
     phrases: list[list] = []

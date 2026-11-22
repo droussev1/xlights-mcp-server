@@ -248,26 +248,32 @@ def test_final_hit_overrides_the_calm_bed(tmp_path, monkeypatch):
 
 
 def test_no_singing_where_the_transcriptions_disagree():
-    # The mix hears the 5.2 and 5.7 s words differently: a different-word passage
+    # The mix hears the 5.2 and 5.7 s words differently
     mix = [w.model_copy(update={"word": "uh"}) if 5.2 <= w.start_time < 6.1 else w for w in WORDS]
-    bad, _, passages = show_rules.cross_check(WORDS, mix, 0.35)
-    assert [(p.start, p.end, p.mix) for p in passages] == [(5.2, 6.1, "uh uh")]
-    # ...and hears the 6.7 s word half a second later: a timing disagreement
-    mix = [w.model_copy(update={"start_time": w.start_time + 0.5, "end_time": w.end_time + 0.5})
-           if 6.6 <= w.start_time < 6.8 else w for w in WORDS]
     disputed = []
     moments = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS, SingingMoments(**MOMENTS),
                                               reference_words=mix, disputed=disputed)
-    assert [(d.start, d.end) for d in disputed] == [(6.7, 7.6)]
-    # 4.2–6.6 s still sings; after the disputed word only a fragment (7.2–7.6 s) is left
-    assert [(m.start, round(m.end, 1)) for m in moments] == [(4.2, 6.6)]
+    assert [(d.start, d.end, d.stem, d.mix) for d in disputed] == [
+        (5.2, 6.1, "w5.2 w5.7", "uh uh")]
+    # Only fragments are left either side (4.2–5.1 s, 6.2–7.6 s): nothing sings
+    assert [(m.start, round(m.end, 1)) for m in moments] == []
     off = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS, SingingMoments(**MOMENTS, cross_check=False),
                                           reference_words=mix)
     assert [(m.start, round(m.end, 1)) for m in off] == [(4.2, 7.6)]
 
 
+def test_same_words_heard_at_different_times_keep_the_stems_timing():
+    mix = [w.model_copy(update={"start_time": w.start_time + 0.8, "end_time": w.end_time + 0.8})
+           if 6.6 <= w.start_time < 6.8 else w for w in WORDS]
+    disputed = []
+    moments = show_rules.pick_singing_moments(WORDS, _analysis(), TIERS, SingingMoments(**MOMENTS),
+                                              reference_words=mix, disputed=disputed)
+    assert disputed == []
+    assert [(m.start, round(m.end, 1)) for m in moments] == [(4.2, 7.6)]
+
+
 def test_words_only_the_mix_heard_break_the_phrase():
     stem = _words(4.2, 8.0)
     mix = stem[:4] + [LyricWord(word="extra", start_time=5.9, end_time=6.0)] + stem[4:]
-    bad, breaks, passages = show_rules.cross_check(stem, mix, 0.35)
+    bad, breaks, passages = show_rules.cross_check(stem, mix)
     assert bad == set() and breaks == {4} and passages[0].mix == "extra"
