@@ -200,7 +200,54 @@ def list_models() -> dict:
         "show": config.active_show,
         "model_count": len(models),
         "models": [m.model_dump() for m in models],
+        "model_priorities": config.model_priorities.get(config.active_show, {}),
     }
+
+
+@mcp.tool()
+def set_model_priority(names: list[str], priority: str, show_name: str | None = None) -> dict:
+    """Set how prominent models or model groups are in generated sequences.
+
+    Priorities:
+        hero — the stars of the show: motion in every section but the intro/outro,
+               accent hits from medium energy up, faster effect changes
+        key — important props: keep moving through quiet sections too
+        normal — default behavior (setting this clears a saved priority)
+        optional — nice-to-have props: only light up in high-energy sections
+
+    Models with a priority other than normal get full effects instead of singing faces.
+
+    Args:
+        names: Model or model group names (a group's priority applies to its members)
+        priority: One of "hero", "key", "normal", "optional"
+        show_name: Show to configure (defaults to the active show)
+    """
+    from xlights_mcp.sequencer.engine import PRIORITIES
+    from xlights_mcp.xlights.show import load_show_config
+
+    if priority not in PRIORITIES:
+        return {"error": f"Invalid priority '{priority}'. Use: {', '.join(PRIORITIES)}"}
+
+    config = get_config()
+    show = show_name or config.active_show
+    show_path = config.get_show_path(show)
+    if not show_path or not show_path.exists():
+        return {"error": f"Show '{show}' not found.", "available_shows": config.list_shows()}
+
+    show_config = load_show_config(show_path)
+    known = {m.name for m in show_config.models} | {g.name for g in show_config.model_groups}
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        return {"error": f"Unknown models or groups: {unknown}"}
+
+    show_priorities = config.model_priorities.setdefault(show, {})
+    for name in names:
+        if priority == "normal":
+            show_priorities.pop(name, None)
+        else:
+            show_priorities[name] = priority
+    save_config(config)
+    return {"show": show, "model_priorities": show_priorities}
 
 
 @mcp.tool()
@@ -451,6 +498,7 @@ def create_sequence(
         theme=theme,
         audio_config=config.audio,
         vocal_assignments=vocal_assignments,
+        model_priorities=config.model_priorities.get(config.show_name_for(show_path) or "", {}),
     )
     return result
 

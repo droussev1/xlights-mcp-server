@@ -40,6 +40,8 @@ class ServerConfig(BaseModel):
     detected_folders: dict[str, str] = Field(default_factory=dict)
     fpp: FPPConfig = Field(default_factory=FPPConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    # show name → {model or group name → "hero" | "key" | "optional"}
+    model_priorities: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     @property
     def active_show_path(self) -> Path | None:
@@ -54,6 +56,13 @@ class ServerConfig(BaseModel):
         folder = self.show_folders.get(show_name)
         if folder:
             return Path(folder).expanduser()
+        return None
+
+    def show_name_for(self, show_path: Path) -> str | None:
+        """Reverse lookup: the configured name for a show folder path."""
+        for name, folder in self.show_folders.items():
+            if Path(folder).expanduser() == show_path:
+                return name
         return None
 
     def list_shows(self) -> list[str]:

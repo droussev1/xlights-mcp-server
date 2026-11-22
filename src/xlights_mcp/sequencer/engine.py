@@ -348,14 +348,20 @@ def _detect_model_groups(
         group_categories: dict[str, str] = {}
         grouped_names: set[str] = set()
 
-        for mg in show_config.model_groups:
-            members = [model_by_name[n] for n in mg.members if n in model_by_name]
-            if len(members) >= 2:
-                groups[mg.name] = members
+        # Smallest groups first, skipping any group that overlaps one already taken, so
+        # umbrella groups like "ALL" don't stack a second set of effects on every model
+        candidates = [
+            (mg.name, [model_by_name[n] for n in mg.members if n in model_by_name])
+            for mg in show_config.model_groups
+        ]
+        candidates.sort(key=lambda c: len(c[1]))
+        for name, members in candidates:
+            if len(members) >= 2 and not any(m.name in grouped_names for m in members):
+                groups[name] = members
                 grouped_names.update(m.name for m in members)
                 # Derive category from majority of member model categories
                 cats = [m.model_category for m in members]
-                group_categories[mg.name] = max(set(cats), key=cats.count)
+                group_categories[name] = max(set(cats), key=cats.count)
 
         if groups:
             ungrouped = [m for m in models if m.name not in grouped_names]
@@ -388,6 +394,29 @@ def _detect_model_groups(
     return groups, ungrouped, group_categories
 
 
+PRIORITIES = ("hero", "key", "normal", "optional")
+_PRIORITY_RANK = {p: i for i, p in enumerate(PRIORITIES)}
+
+
+def _resolve_model_priorities(
+    priorities: dict[str, str] | None, show_config: ShowConfig,
+) -> dict[str, str]:
+    """Expand model/group priority settings to a per-model map.
+
+    Group entries apply to their members; an entry naming a model directly wins.
+    """
+    if not priorities:
+        return {}
+    resolved: dict[str, str] = {}
+    for mg in show_config.model_groups:
+        if mg.name in priorities:
+            for member in mg.members:
+                resolved[member] = priorities[mg.name]
+    model_names = {m.name for m in show_config.models}
+    resolved.update({n: p for n, p in priorities.items() if n in model_names})
+    return resolved
+
+
 def generate_sequence(
     mp3_path: Path,
     show_path: Path | None,
@@ -396,6 +425,7 @@ def generate_sequence(
     theme: str | None = None,
     audio_config: AudioConfig | None = None,
     vocal_assignments: dict[str, str] | None = None,
+    model_priorities: dict[str, str] | None = None,
 ) -> dict:
     """Generate a complete xLights sequence from a music file.
 
@@ -404,6 +434,8 @@ def generate_sequence(
             Use "all" as key to assign a track to all singing models.
             If None and singing models exist, returns discovery info instead
             of generating, so the caller can prompt the user.
+        model_priorities: Optional mapping of model or group name → priority
+            ("hero", "key", "normal", "optional").
     """
     if not show_path or not show_path.exists():
         return {"error": f"Show path not found: {show_path}"}
@@ -418,6 +450,7 @@ def generate_sequence(
         return _generate_auto(
             analysis, show_config, mp3_path, palette_hint, theme,
             vocal_assignments=vocal_assignments,
+            model_priorities=model_priorities,
         )
     elif mode == "guided":
         return _generate_guided_preview(analysis, show_config)
@@ -473,6 +506,7 @@ def _generate_auto(
     palette_hint: str | None,
     theme: str | None,
     vocal_assignments: dict[str, str] | None = None,
+    model_priorities: dict[str, str] | None = None,
 ) -> dict:
     """Professional-quality automatic sequence generation.
 
@@ -482,6 +516,11 @@ def _generate_auto(
       Layer 2: Accent hits (shockwave, morph) — on drum hits, or the beat grid without stems
 
     Grouped models (canes, arches, etc.) get identical effects for synchronization.
+
+    Model priorities scale how busy a model is: "hero" models get motion in every
+    section but the intro/outro, accents from medium energy up and faster variation;
+    "key" models keep motion through low-energy sections; "optional" models only
+    light up in high-energy sections. Prioritized models never run singing faces.
     """
     rng = random.Random(hash(mp3_path.stem))  # deterministic per song
 
@@ -504,11 +543,13 @@ def _generate_auto(
     for gname, members in groups.items():
         logger.info(f"  Group '{gname}': {[m.name for m in members]}")
 
+    priority_of = _resolve_model_priorities(model_priorities, show_config)
+
     # Identify singing models (models with face definitions) — exclude from regular pipeline
     singing_models: dict[str, str] = {}  # model_name → face_definition_name
     singing_model_names: set[str] = set()
     for m in show_config.models:
-        if m.face_definitions:
+        if m.face_definitions and priority_of.get(m.name, "normal") == "normal":
             singing_models[m.name] = m.face_definitions[0]
             singing_model_names.add(m.name)
 
@@ -530,10 +571,16 @@ def _generate_auto(
     def generate_for_models(model_names: list[str], cat: str, group_seed: str):
         group_rng = random.Random(hash(group_seed + mp3_path.stem))
         stem_data: StemAnalysis = analysis.stem_analysis
+        # A group takes the highest priority among its members
+        priority = min(
+            (priority_of.get(n, "normal") for n in model_names), key=_PRIORITY_RANK.__getitem__
+        )
 
         for sec_idx, section in enumerate(analysis.sections):
             is_high = section.energy_level >= HIGH_ENERGY_THRESHOLD
             is_low = section.energy_level < LOW_ENERGY_THRESHOLD
+            if priority == "optional" and not is_high:
+                continue
 
             pal_idx = (sec_idx // 2 + hash(group_seed)) % len(palette_pool)
             palette = palette_pool[pal_idx]
@@ -544,6 +591,11 @@ def _generate_auto(
             sec_config = SECTION_TYPE_CONFIG.get(section.label, SECTION_TYPE_CONFIG["unknown"])
             use_motion = sec_config.get("use_motion", True) and not is_low
             use_accents = sec_config.get("use_accents", False) and is_high
+            if priority == "hero":
+                use_motion = section.label not in ("intro", "outro")
+                use_accents = use_motion and (is_high or (sec_config.get("use_accents", False) and not is_low))
+            elif priority == "key":
+                use_motion = sec_config.get("use_motion", True)
 
             # Determine dominant stem for this section
             dom_stem = "other"
@@ -592,6 +644,8 @@ def _generate_auto(
                 if len(downbeats_in_section) >= 2:
                     # Vary effect every 2-4 bars within the section
                     bars_per_variant = 2 if is_high else 4
+                    if priority == "hero":
+                        bars_per_variant //= 2
                     variant_idx = 0
                     for j in range(len(downbeats_in_section) - 1):
                         if j > 0 and j % bars_per_variant == 0:
