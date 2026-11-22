@@ -106,7 +106,8 @@ def write_xsq(
 
     # Build unique palettes
     palette_strings: list[str] = []
-    for palette in spec.palettes:
+    # Spec palettes first, then any palette an effect carries that isn't listed
+    for palette in [*spec.palettes, *(e.palette for e in spec.effects if e.palette)]:
         ps = palette.to_xlights_string()
         if ps not in palette_strings:
             palette_strings.append(ps)

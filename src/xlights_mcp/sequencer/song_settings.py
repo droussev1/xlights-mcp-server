@@ -10,6 +10,8 @@ All fields are optional:
       "sections": [                    # manual marks: split sections and force tiers
         {"name": "climax", "start": 65.5, "end": 72.4, "tier": "peak"}
       ],
+      "signature_colors": ["#7B2FBE"], # this song's accent colors (overrides the show's pick)
+      "final_hit": 113.0,              # seconds; overrides the detected final hit
       "effects": [                     # custom effects, replacing generated ones on the
         {                              # same models/layer within their time range
           "section": "climax",         # a mark name, or "start"/"end" in seconds
@@ -30,7 +32,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from xlights_mcp.audio.analyzer import SongAnalysis
 from xlights_mcp.audio.structure import SongSection
@@ -87,6 +89,18 @@ class SongSettings(BaseModel):
     unmarked_tier: Tier | None = None
     sections: list[SectionMark] = Field(default_factory=list)
     effects: list[CustomEffect] = Field(default_factory=list)
+    signature_colors: list[str] | None = Field(default=None, min_length=1, max_length=2)
+    final_hit: float | None = None  # seconds; overrides the detected final hit
+
+    @field_validator("signature_colors")
+    @classmethod
+    def _colors(cls, v):
+        if v is not None:
+            for c in v:
+                if len(c) != 7 or c[0] != "#" or any(ch not in "0123456789abcdefABCDEF" for ch in c[1:]):
+                    raise ValueError(f"signature color '{c}' is not #RRGGBB")
+            v = [c.upper() for c in v]
+        return v
 
     @model_validator(mode="after")
     def _references(self):
@@ -168,17 +182,21 @@ def apply_to_analysis(
 def validate_models(settings: SongSettings, show_config: ShowConfig) -> None:
     """Raise ValueError if a custom effect names a model or group the show lacks."""
     for custom in settings.effects:
-        _expand_models(custom.models, show_config)
+        expand_models(custom.models, show_config)
 
 
-def _expand_models(names: list[str], show_config: ShowConfig) -> list[str]:
+def expand_models(names: list[str], show_config: ShowConfig) -> list[str]:
+    """Resolve model and group names (recursively) to model names.
+
+    Submodel members of groups ("Model/Sub") are skipped; unknown names raise ValueError.
+    """
     groups = {g.name: g.members for g in show_config.model_groups}
     models = {m.name for m in show_config.models}
     out: list[str] = []
     seen: set[str] = set()
 
     def visit(name: str):
-        if name in seen:
+        if name in seen or (name not in groups and "/" in name):
             return
         seen.add(name)
         if name in models:
@@ -187,11 +205,29 @@ def _expand_models(names: list[str], show_config: ShowConfig) -> list[str]:
             for member in groups[name]:
                 visit(member)
         else:
-            raise ValueError(f"Unknown model or group in song settings: '{name}'")
+            raise ValueError(f"Unknown model or group: '{name}'")
 
     for n in names:
         visit(n)
     return out
+
+
+def clip_out(
+    effects: list[EffectPlacement], names: list[str], layer: int | None, lo: int, hi: int,
+) -> list[EffectPlacement]:
+    """Clip effects on these models (and layer, or all layers if None) out of [lo, hi) ms."""
+    names = set(names)
+    kept: list[EffectPlacement] = []
+    for e in effects:
+        if (e.model_name not in names or (layer is not None and e.layer != layer)
+                or e.end_time_ms <= lo or e.start_time_ms >= hi):
+            kept.append(e)
+            continue
+        if lo - e.start_time_ms >= MIN_CLIP_MS:
+            kept.append(e.model_copy(update={"end_time_ms": lo}))
+        if e.end_time_ms - hi >= MIN_CLIP_MS:
+            kept.append(e.model_copy(update={"start_time_ms": hi}))
+    return kept
 
 
 def apply_custom_effects(
@@ -211,19 +247,8 @@ def apply_custom_effects(
     for custom in settings.effects:
         start, end = settings.effect_range(custom)
         lo, hi = int(start * 1000), int(end * 1000)
-        names = _expand_models(custom.models, show_config)
-
-        # Clip generated effects on these models/layer out of [lo, hi)
-        kept: list[EffectPlacement] = []
-        for e in effects:
-            if e.model_name not in names or e.layer != custom.layer or e.end_time_ms <= lo or e.start_time_ms >= hi:
-                kept.append(e)
-                continue
-            if lo - e.start_time_ms >= MIN_CLIP_MS:
-                kept.append(e.model_copy(update={"end_time_ms": lo}))
-            if e.end_time_ms - hi >= MIN_CLIP_MS:
-                kept.append(e.model_copy(update={"start_time_ms": hi}))
-        effects = kept
+        names = expand_models(custom.models, show_config)
+        effects = clip_out(effects, names, custom.layer, lo, hi)
 
         if custom.effect in engine.EFFECT_VARIANTS:
             effect_name = engine._effect_name_from_key(custom.effect)

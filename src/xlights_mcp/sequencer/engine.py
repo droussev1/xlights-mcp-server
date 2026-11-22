@@ -26,7 +26,9 @@ from pathlib import Path
 from xlights_mcp.audio.analyzer import SongAnalysis, StemAnalysis, full_analysis
 from xlights_mcp.audio.structure import SongSection
 from xlights_mcp.config import AudioConfig
+from xlights_mcp.sequencer import show_rules as show_rules_mod
 from xlights_mcp.sequencer import song_settings as song_settings_mod
+from xlights_mcp.sequencer.show_rules import ShowRules
 from xlights_mcp.sequencer.song_settings import SongSettings
 from xlights_mcp.xlights.models import LightModel, ShowConfig
 from xlights_mcp.xlights.palettes import ColorPalette, get_theme_palettes
@@ -482,20 +484,30 @@ def generate_sequence(
         settings, settings_path = song_settings_mod.load_song_settings(mp3_path)
         if settings:
             song_settings_mod.validate_models(settings, show_config)
+        rules, rules_path = show_rules_mod.load_show_rules(show_path)
+        if rules:
+            show_rules_mod.validate_models(rules, show_config)
     except ValueError as exc:
         return {"error": str(exc)}
 
     analysis = full_analysis(mp3_path, audio_config)
 
     if mode == "auto":
-        result = _generate_auto(
-            analysis, show_config, mp3_path, palette_hint, theme,
-            vocal_assignments=vocal_assignments,
-            model_priorities=model_priorities,
-            song_settings=settings,
-        )
-        if settings_path and result.get("success"):
-            result["song_settings"] = str(settings_path)
+        try:
+            result = _generate_auto(
+                analysis, show_config, mp3_path, palette_hint, theme,
+                vocal_assignments=vocal_assignments,
+                model_priorities=model_priorities,
+                song_settings=settings,
+                show_rules=rules,
+            )
+        except ValueError as exc:  # a per-song setting breaks a show rule
+            return {"error": str(exc)}
+        if result.get("success"):
+            if settings_path:
+                result["song_settings"] = str(settings_path)
+            if rules_path:
+                result["show_rules"] = str(rules_path)
         return result
     elif mode == "guided":
         return _generate_guided_preview(analysis, show_config)
@@ -564,6 +576,7 @@ def _generate_auto(
     vocal_assignments: dict[str, str] | None = None,
     model_priorities: dict[str, str] | None = None,
     song_settings: SongSettings | None = None,
+    show_rules: ShowRules | None = None,
 ) -> dict:
     """Professional-quality automatic sequence generation.
 
@@ -584,6 +597,8 @@ def _generate_auto(
     never run singing faces.
 
     A song settings file can re-anchor bars, force section tiers and add custom effects.
+    Show rules (see show_rules.py) then own exclusions, singers, floods, the final hit,
+    symmetry, the arch chase, strobe placement and palettes.
     """
     forced_tiers = None
     if song_settings:
@@ -605,21 +620,54 @@ def _generate_auto(
     section_downbeats = _precompute_section_downbeats(analysis)
     section_tiers = _rank_section_energy(analysis.sections, forced_tiers)
 
+    # Models the rules own (excluded, floods, final-hit props) skip generic generation
+    skip = show_rules_mod.generic_skip(show_rules, show_config)
+    generic_models = [m for m in show_config.models if m.name not in skip]
+
     # Detect model groups (uses xLights-defined groups, falls back to prefix detection)
-    groups, ungrouped, group_categories = _detect_model_groups(show_config.models, show_config)
+    groups, ungrouped, group_categories = _detect_model_groups(generic_models, show_config)
     logger.info(f"Detected {len(groups)} model groups, {len(ungrouped)} ungrouped models")
     for gname, members in groups.items():
         logger.info(f"  Group '{gname}': {[m.name for m in members]}")
 
     priority_of = _resolve_model_priorities(model_priorities, show_config)
+    if show_rules and show_rules.priorities:  # show rules win over saved priorities
+        priority_of.update(_resolve_model_priorities(show_rules.priorities, show_config))
 
-    # Identify singing models (models with face definitions) — exclude from regular pipeline
+    # Identify singing models — the rules' singers, else normal-priority face models
+    singers = set(show_rules.singing.singers) if show_rules and show_rules.singing else None
     singing_models: dict[str, str] = {}  # model_name → face_definition_name
-    singing_model_names: set[str] = set()
-    for m in show_config.models:
-        if m.face_definitions and priority_of.get(m.name, "normal") == "normal":
+    for m in generic_models:
+        if m.face_definitions and (
+            m.name in singers if singers is not None else priority_of.get(m.name, "normal") == "normal"
+        ):
             singing_models[m.name] = m.face_definitions[0]
-            singing_model_names.add(m.name)
+
+    # Without lyrics, singers run regular effects (with the rules' fallback priorities)
+    vocal_tracks = _try_extract_vocal_tracks(mp3_path) if singing_models else []
+    if singing_models and not vocal_tracks:
+        logger.info("Lyrics unavailable — singing models treated as regular models")
+        singing_models = {}
+        if show_rules and show_rules.singing:
+            priority_of.update(_resolve_model_priorities(show_rules.singing.without_lyrics, show_config))
+    if singing_models and vocal_assignments is None:
+        return {
+            "needs_vocal_assignment": True,
+            "singing_models": [
+                {"model_name": n, "face_definition": f} for n, f in singing_models.items()
+            ],
+            "vocal_tracks": [
+                {"track_name": t.track_name, "source": t.source, "word_count": len(t.words)}
+                for t in vocal_tracks
+            ],
+            "message": (
+                "Singing face models and vocal tracks detected. "
+                "Please assign vocal tracks to models using the vocal_assignments parameter. "
+                "Pass a dict mapping model names to track names, "
+                'or use {"all": "<track_name>"} to assign one track to all singing models.'
+            ),
+        }
+    singing_model_names = set(singing_models)
 
     # Remove singing models from groups and ungrouped lists
     for group_name in list(groups.keys()):
@@ -859,38 +907,8 @@ def _generate_auto(
     resolved_assignments: dict[str, str] = {}
 
     if singing_models:
-        # Extract all available vocal tracks
-        vocal_tracks = _try_extract_vocal_tracks(mp3_path)
-
         if vocal_tracks:
             has_lyrics = True
-
-            # If no vocal_assignments provided, return discovery info for the agent
-            if vocal_assignments is None:
-                singing_info = []
-                for mname, fdef in singing_models.items():
-                    singing_info.append({
-                        "model_name": mname,
-                        "face_definition": fdef,
-                    })
-                track_info = []
-                for t in vocal_tracks:
-                    track_info.append({
-                        "track_name": t.track_name,
-                        "source": t.source,
-                        "word_count": len(t.words),
-                    })
-                return {
-                    "needs_vocal_assignment": True,
-                    "singing_models": singing_info,
-                    "vocal_tracks": track_info,
-                    "message": (
-                        "Singing face models and vocal tracks detected. "
-                        "Please assign vocal tracks to models using the vocal_assignments parameter. "
-                        "Pass a dict mapping model names to track names, "
-                        'or use {"all": "<track_name>"} to assign one track to all singing models.'
-                    ),
-                }
 
             # Resolve "all" shorthand → expand to every singing model
             resolved_assignments: dict[str, str] = {}
@@ -986,16 +1004,37 @@ def _generate_auto(
                 f"Added singing pipeline for {list(singing_models.keys())} "
                 f"with assignments: {resolved_assignments}"
             )
-        else:
-            # Lyrics unavailable — treat singing models as regular custom models
-            for model_name in singing_models:
-                generate_for_models([model_name], "custom", model_name)
-            logger.info("Lyrics unavailable — singing models treated as regular custom models")
+
+    signatures: list[str] = []
+    share = None
+    if show_rules:
+        final_hit = show_rules_mod.final_hit_time(analysis, section_tiers, song_settings)
+        all_effects = show_rules_mod.apply_structure(
+            show_rules, all_effects, analysis, section_tiers, show_config, priority_of, final_hit,
+            preset=lambda key: (_effect_name_from_key(key), _get_settings(key)),
+        )
+        strobe_presets = {k for k in EFFECT_VARIANTS if _effect_name_from_key(k) == "Strobe"}
+        show_rules_mod.check_strobes(
+            show_rules, song_settings,
+            show_rules_mod.finale_range(analysis, section_tiers, song_settings), strobe_presets,
+        )
 
     if song_settings and song_settings.effects:
         all_effects = song_settings_mod.apply_custom_effects(
             song_settings, all_effects, analysis, show_config, palette_pool,
         )
+
+    if show_rules:
+        excluded = show_rules_mod.excluded_models(show_rules, show_config)
+        all_effects = [e for e in all_effects if e.model_name not in excluded]
+        if show_rules.palettes:
+            signatures = show_rules_mod.pick_signatures(
+                show_rules, Path(show_config.show_path), mp3_path.stem,
+                song_settings.signature_colors if song_settings else None,
+            )
+            all_effects, share = show_rules_mod.apply_palettes(
+                show_rules, all_effects, analysis, section_tiers, show_config, priority_of, signatures,
+            )
 
     # Build sequence spec
     spec = SequenceSpec(
@@ -1016,6 +1055,8 @@ def _generate_auto(
             counter += 1
 
     write_xsq(spec, show_config, output_path)
+    if signatures:
+        show_rules_mod.record_signatures(Path(show_config.show_path), mp3_path.stem, signatures)
 
     layers_used = set(e.layer for e in all_effects)
 
@@ -1026,7 +1067,7 @@ def _generate_auto(
         "duration": f"{analysis.duration_seconds:.1f}s",
         "tempo": f"{analysis.beats.tempo:.0f} BPM",
         "sections": len(analysis.sections),
-        "models_with_effects": len(show_config.models),
+        "models_with_effects": len({e.model_name for e in all_effects}),
         "total_effects": len(all_effects),
         "layers_used": len(layers_used),
         "unique_palettes": len(all_palettes),
@@ -1035,6 +1076,8 @@ def _generate_auto(
         "timing_tracks": [t.name for t in timing_tracks],
         "singing_models": list(singing_models.keys()) if has_lyrics else [],
         "vocal_assignments": resolved_assignments if has_lyrics and singing_models else {},
+        "signature_colors": signatures,
+        "accent_share": share,
         "message": f"Sequence created: {output_path.name}. Open in xLights to preview and render.",
     }
 

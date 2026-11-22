@@ -353,7 +353,30 @@ To hand-tune one song, put a JSON file next to the music file with the same name
 | `bar_anchor` | Seconds; a bar starts on the beat nearest this time (fixes a misdetected bar grid) |
 | `sections` | Named marks with `start`, `end`, `tier` (`peak` / `normal` / `breather`) and optional `label` (e.g. `bridge`). Sections are split at marks; marks within 0.25 s of a detected boundary snap to it |
 | `unmarked_tier` | Tier for sections no mark covers. Omit it to rank them by energy as usual |
+| `signature_colors` | One or two `#RRGGBB` accent colors for this song, overriding the show's pick |
+| `final_hit` | Seconds; overrides the detected final hit |
 | `effects` | Custom effects on `models` (model or group names) for a named `section` or a `start`/`end` range, on `layer` 0–2. `effect` is an engine preset (`Strobe_flash`, `Butterfly_gentle`, `Spirals_fast`, …) or any xLights effect name; `settings` override preset values. `every_beats` repeats it on every Nth beat from the bar line (`length_beats` long); omit both for one effect across the range. Generated effects on the same models and layer are cleared from that range |
+
+#### Show rules
+
+Show-wide rules live in `xlights_mcp_rules.json` in the show folder. `create_sequence`
+reads the file on every run and the generator enforces it; a per-song setting that breaks
+a rule (such as a strobe outside the finale) is rejected with an error. All fields are
+optional:
+
+| Field | Enforced as |
+|-------|-------------|
+| `notes` | The rules in plain words (not used by the generator) |
+| `exclude` | Models or groups that never get effects |
+| `priorities` | `hero` / `key` / `normal` / `optional` per model or group, always applied; overrides `set_model_priority` |
+| `symmetry` | `pairs` of `[left, right]` props; `default` and `by_tier` modes: `mirror` (right side = left side flipped horizontally), `call_response` (motion and accents alternate sides bar by bar), `sync` (identical) |
+| `arch_chase` | Arch models listed left to right with their arch `count` (and `reverse` if wired right to left); their motion becomes one arch per beat, starting on the bar line, in every non-breather section |
+| `floods` | One solid color per section — never motion or accents |
+| `twinkle` | Props that only twinkle in the given `tiers` (intro/outro count as breathers) |
+| `final_hit` | Props kept dark until the final hit (the beat nearest the end of the last peak, or the per-song `final_hit`), then held for `bars` and faded |
+| `singing` | Which face models sing (`singers`), and the priorities to use while lyrics are unavailable (`without_lyrics`) |
+| `strobes` | Strobes only inside the finale (a section mark named `finale`, else the last run of peaks), every `every_beats` beats |
+| `palettes` | `core` palettes chosen by `by_model` → `by_section_label` → `by_tier` → `default` (plus `arch_chase`); per-song signature colors drawn from `accent_pool` go on secondary props at peaks, on every other hero accent hit (always paired with a core color) and on one featured section, capped at `max_accent_share` of effect time. Signatures are remembered per song in `xlights_mcp_signatures.json` so songs don't repeat them; `signature_colors` in a song's settings file overrides them |
 
 ### Import a community sequence
 
