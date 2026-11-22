@@ -17,13 +17,34 @@ from xlights_mcp.xlights.models import (
 logger = logging.getLogger(__name__)
 
 
+def _custom_model_node_count(m) -> int:
+    """Distinct node numbers in a Custom model's node map.
+
+    CustomModelCompressed is "node,row,col[,layer];..." entries; CustomModel is
+    a grid with cells split by ",", rows by ";" and layers by "|".
+    """
+    nodes: set[str] = set()
+    if compressed := m.get("CustomModelCompressed"):
+        nodes = {e.split(",", 1)[0].strip() for e in compressed.split(";")}
+    elif grid := m.get("CustomModel"):
+        nodes = {c.strip() for c in grid.replace("|", ";").replace(";", ",").split(",")}
+    return len({n for n in nodes if n.isdigit()})
+
+
 def model_pixel_count(m) -> int:
     """Pixel count of a <model> element (ElementTree or lxml).
 
-    Checks PixelCount, then parm1 x parm2 (pre-2026 layouts), then
-    NumStrings x NodesPerString (xLights 2026+ layouts, which dropped parm1/parm2).
+    Checks PixelCount, then parm1 x parm2 (pre-2026 layouts), then the xLights 2026+
+    attributes that replaced parm1/parm2: NumStrings x NodesPerString, NumArches x
+    NodesPerArch, NumCanes x NodesPerCane, and finally a Custom model's node map.
     """
-    for a, b in ((None, "PixelCount"), ("parm1", "parm2"), ("NumStrings", "NodesPerString")):
+    for a, b in (
+        (None, "PixelCount"),
+        ("parm1", "parm2"),
+        ("NumStrings", "NodesPerString"),
+        ("NumArches", "NodesPerArch"),
+        ("NumCanes", "NodesPerCane"),
+    ):
         try:
             if a is None:
                 if m.get(b):
@@ -32,7 +53,7 @@ def model_pixel_count(m) -> int:
                 return int(m.get(a)) * int(m.get(b))
         except ValueError:
             continue
-    return 0
+    return _custom_model_node_count(m)
 
 
 def load_show_config(show_path: Path) -> ShowConfig:

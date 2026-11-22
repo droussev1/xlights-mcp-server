@@ -29,6 +29,25 @@ class TestModelPixelCount:
         m = etree.fromstring('<model name="Arch" NumStrings="4" NodesPerString="50"/>')
         assert model_pixel_count(m) == 200
 
+    def test_arches(self):
+        m = ET.fromstring('<model name="Arches" DisplayAs="Arches" NumArches="4" NodesPerArch="50"/>')
+        assert model_pixel_count(m) == 200
+
+    def test_candy_canes(self):
+        m = ET.fromstring('<model name="Canes" DisplayAs="Candy Canes" NumCanes="3" NodesPerCane="99"/>')
+        assert model_pixel_count(m) == 297
+
+    def test_custom_model_compressed(self):
+        # Node 2 appears twice (two cells sharing a node) and counts once
+        m = ET.fromstring(
+            '<model name="Present" DisplayAs="Custom" CustomModelCompressed="1,0,0;2,0,1;2,1,1;3,1,2"/>'
+        )
+        assert model_pixel_count(m) == 3
+
+    def test_custom_model_grid_with_layers(self):
+        m = ET.fromstring('<model name="Hat" DisplayAs="Custom" CustomModel="1,,2;,3,|4,,;,,5"/>')
+        assert model_pixel_count(m) == 5
+
     def test_no_size_attributes(self):
         assert model_pixel_count(ET.fromstring('<model name="X"/>')) == 0
 
